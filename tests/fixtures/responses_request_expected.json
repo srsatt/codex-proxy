@@ -1,0 +1,28 @@
+{
+  "model": "gpt-5.3-codex",
+  "stream": true,
+  "store": false,
+  "input": [
+    {
+      "type": "message",
+      "role": "user",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "write a hello world file"
+        }
+      ]
+    },
+    {
+      "type": "function_call",
+      "call_id": "call_123",
+      "name": "write_file",
+      "arguments": "{\"path\":\"hello.txt\",\"content\":\"hello\"}"
+    }
+  ],
+  "include": [
+    "something.else",
+    "reasoning.encrypted_content"
+  ],
+  "prompt_cache_key": "session-abc"
+}

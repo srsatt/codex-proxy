@@ -1,0 +1,31 @@
+[server]
+bind = "127.0.0.1"
+port = 8317
+log_filter = "info"
+
+[auth]
+callback_host = "127.0.0.1"
+callback_port = 1455
+open_browser = true
+timeout_seconds = 300
+
+[upstream]
+responses_base_url = "https://chatgpt.com/backend-api"
+codex_responses_path = "/codex/responses"
+authorize_url = "https://auth.openai.com/oauth/authorize"
+token_url = "https://auth.openai.com/oauth/token"
+client_id = "app_EMoamEEZ73f0CkXaXp7hrann"
+scope = "openid profile email offline_access"
+originator = "codex_cli_rs"
+beta_header = "responses=experimental"
+
+[models]
+advertised = ["gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex"]
+fallback = "gpt-5.4"
+
+[models.aliases]
+"openai/gpt-5.4" = "gpt-5.4"
+"openai/gpt-5.4-mini" = "gpt-5.4-mini"
+"openai/gpt-5.3-codex" = "gpt-5.3-codex"
+"openai/gpt-5-codex" = "gpt-5.3-codex"
+"gpt-5-codex" = "gpt-5.3-codex"

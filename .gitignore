@@ -1,0 +1,15 @@
+.DS_STORE
+/target
+/data
+/config.toml
+
+# example code
+examples/**
+/examples/**
+
+# agents
+.agents/**
+
+# plans
+plans/**
+/plans/**

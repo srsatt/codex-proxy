@@ -1,0 +1,15 @@
+services:
+  codex-proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: codex-proxy:latest
+    container_name: codex-proxy
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8317:8317"
+    volumes:
+      - codex-proxy-data:/app/data
+
+volumes:
+  codex-proxy-data:
