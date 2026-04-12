@@ -355,7 +355,9 @@ pub fn prepare_request_body(
 
     object.insert("store".to_owned(), Value::Bool(false));
     object.insert("stream".to_owned(), Value::Bool(true));
+    // Fields sent by some clients that the upstream rejects.
     object.remove("prompt_cache_retention");
+    object.remove("safety_identifier");
 
     let input_stats = object
         .get_mut("input")
