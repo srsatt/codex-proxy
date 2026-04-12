@@ -23,6 +23,7 @@ use axum::{
 };
 use serde::Deserialize;
 use tokio::{net::TcpListener, sync::oneshot, time::timeout};
+use tracing::{info, warn};
 
 use crate::constants::{CALLBACK_PATH, OAUTH_SUCCESS_HTML};
 
@@ -59,6 +60,10 @@ pub async fn wait_for_authorization_code(
     let listener = TcpListener::bind(format!("{host}:{port}"))
         .await
         .with_context(|| format!("failed to bind OAuth callback listener on {host}:{port}"))?;
+    let local_addr = listener
+        .local_addr()
+        .context("failed to read OAuth callback listener address")?;
+    info!(%local_addr, timeout_secs = timeout_window.as_secs(), "OAuth callback listener is ready");
     let (code_tx, code_rx) = oneshot::channel();
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
@@ -78,15 +83,25 @@ pub async fn wait_for_authorization_code(
             .map_err(|error| anyhow!("OAuth callback server failed: {error}"))
     });
 
-    let code = timeout(timeout_window, code_rx)
-        .await
-        .with_context(|| {
-            format!(
-                "timed out waiting for OAuth callback after {:?}",
-                timeout_window
-            )
-        })?
-        .context("callback listener closed before a code was received")?;
+    let code = match timeout(timeout_window, code_rx).await {
+        Ok(Ok(code)) => {
+            info!(%local_addr, "received OAuth callback successfully");
+            code
+        }
+        Ok(Err(error)) => {
+            warn!(%local_addr, error = %error, "callback listener closed before an authorization code was received");
+            return Err(error).context("callback listener closed before a code was received");
+        }
+        Err(error) => {
+            warn!(%local_addr, timeout_secs = timeout_window.as_secs(), error = %error, "timed out waiting for OAuth callback");
+            return Err(error).with_context(|| {
+                format!(
+                    "timed out waiting for OAuth callback after {:?}",
+                    timeout_window
+                )
+            });
+        }
+    };
 
     let _ = shutdown_tx.send(());
     server_task
@@ -106,6 +121,7 @@ async fn handle_callback(
     Query(query): Query<CallbackQuery>,
 ) -> Result<Html<&'static str>, (StatusCode, String)> {
     let Some(returned_state) = query.state else {
+        warn!("received OAuth callback without `state` parameter");
         return Err((
             StatusCode::BAD_REQUEST,
             "Missing state parameter".to_owned(),
@@ -113,10 +129,12 @@ async fn handle_callback(
     };
 
     if returned_state != state.expected_state {
+        warn!("received OAuth callback with mismatched `state` parameter");
         return Err((StatusCode::BAD_REQUEST, "State mismatch".to_owned()));
     }
 
     let Some(code) = query.code else {
+        warn!("received OAuth callback without authorization code");
         return Err((
             StatusCode::BAD_REQUEST,
             "Missing authorization code".to_owned(),
@@ -124,6 +142,7 @@ async fn handle_callback(
     };
 
     let mut sender = state.code_tx.lock().map_err(|_| {
+        warn!("OAuth callback lock was poisoned");
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             "Callback lock poisoned".to_owned(),
@@ -133,6 +152,7 @@ async fn handle_callback(
     let code_tx = match sender.take() {
         Some(code_tx) => code_tx,
         None => {
+            warn!("received duplicate OAuth callback after authorization code was already consumed");
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Authorization code already consumed".to_owned(),
@@ -141,11 +161,13 @@ async fn handle_callback(
     };
 
     code_tx.send(code).map_err(|_| {
+        warn!("failed to deliver OAuth authorization code to waiting task");
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             "Failed to deliver authorization code".to_owned(),
         )
     })?;
 
+    info!("delivered OAuth authorization code to waiting task");
     Ok(Html(OAUTH_SUCCESS_HTML))
 }

@@ -20,6 +20,7 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use reqwest::Client;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use tracing::{info, warn};
 use url::Url;
 use uuid::Uuid;
 
@@ -161,6 +162,11 @@ async fn request_tokens(
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
         let body = body.trim();
+        warn!(
+            status = %status,
+            body_snippet = %truncate_log_body(body),
+            "OAuth token endpoint returned a non-success response"
+        );
         let detail = if body.is_empty() {
             format!("OAuth token request failed with status {status}")
         } else {
@@ -174,6 +180,11 @@ async fn request_tokens(
         .await
         .context("failed to parse the OAuth token response")?;
     let obtained_at = unix_timestamp_secs();
+    info!(
+        expires_in = token_response.expires_in,
+        scope = %token_response.scope,
+        "received OAuth token response successfully"
+    );
 
     Ok(TokenStore {
         account_id: decode_jwt_account_id(&token_response.access_token)?,
@@ -242,6 +253,17 @@ fn create_code_challenge(pkce_verifier: &str) -> String {
 
 fn default_token_type() -> String {
     "Bearer".to_owned()
+}
+
+fn truncate_log_body(body: &str) -> String {
+    const MAX_CHARS: usize = 256;
+    let compact = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() <= MAX_CHARS {
+        compact
+    } else {
+        let truncated = compact.chars().take(MAX_CHARS).collect::<String>();
+        format!("{truncated}...[truncated]")
+    }
 }
 
 #[cfg(test)]

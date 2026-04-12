@@ -3,10 +3,10 @@
 `codex-proxy` is a local Rust daemon that authenticates you with ChatGPT via
 OAuth and exposes an OpenAI-compatible API endpoint. Point any coding tool that
 speaks the OpenAI API at `http://127.0.0.1:8317` and it will be transparently
-proxied to the ChatGPT Codex backend — no real OpenAI API key required.
+proxied to the ChatGPT Codex backend - no real OpenAI API key required.
 
 ```
- Coding tool  ──(fake key)──▶  codex-proxy  ──(OAuth token)──▶  ChatGPT Codex
+ Coding tool - (fake key) -> codex-proxy -> (OAuth token) -> ChatGPT Codex
 ```
 
 ---

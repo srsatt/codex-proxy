@@ -19,8 +19,9 @@ use serde_json::{Map, Value, json};
 use crate::config::{ModelsConfig, RequestDefaultsConfig};
 
 use super::forwarding::{
-    ForwardingState, PreparedRequest, error_response, extract_success_response_json,
-    map_upstream_error, prepare_request_body, send_prepared_request,
+    ForwardingState, PreparedRequest, UpstreamExchange, error_response,
+    error_response_with_request_id, extract_success_response_json, map_upstream_error,
+    prepare_request_body, send_prepared_request,
 };
 
 /// Handler for `POST /v1/chat/completions`.
@@ -34,41 +35,62 @@ pub async fn forward_chat_completions(
     request_headers: &HeaderMap,
     request_body: Bytes,
 ) -> Response {
+    let request_id = uuid::Uuid::new_v4().to_string();
     let prepared_request = match translate_chat_completions_request(
         &request_body,
         &state.config.request_defaults,
         &state.config.models,
     ) {
         Ok(prepared_request) => prepared_request,
-        Err(error) => return error_response(StatusCode::BAD_REQUEST, error.to_string()),
+        Err(error) => {
+            tracing::warn!(%request_id, route_kind = "chat_completions", error = %error, "failed to translate chat completions request");
+            return error_response_with_request_id(
+                StatusCode::BAD_REQUEST,
+                error.to_string(),
+                &request_id,
+            );
+        }
     };
 
     if prepared_request.original_stream {
-        return error_response(
+        tracing::warn!(%request_id, route_kind = "chat_completions", "streaming chat completions compatibility request is not supported");
+        return error_response_with_request_id(
             StatusCode::NOT_IMPLEMENTED,
             "streaming `/v1/chat/completions` compatibility is not implemented yet; use `/v1/responses` for streaming requests",
+            &request_id,
         );
     }
 
-    let upstream_response = match send_prepared_request(
+    let upstream = match send_prepared_request(
         state,
         request_headers,
         &prepared_request,
         "chat_completions",
+        &request_id,
     )
     .await
     {
         Ok(response) => response,
-        Err(error) => return error_response(StatusCode::BAD_GATEWAY, error.to_string()),
+        Err(error) => {
+            return error_response_with_request_id(
+                StatusCode::BAD_GATEWAY,
+                error.to_string(),
+                &request_id,
+            );
+        }
     };
 
-    if !upstream_response.status().is_success() {
-        return map_upstream_error(upstream_response).await;
+    if !upstream.response.status().is_success() {
+        return map_upstream_error(upstream).await;
     }
 
-    match adapt_chat_completions_response(upstream_response).await {
+    match adapt_chat_completions_response(upstream).await {
         Ok(response) => response,
-        Err(error) => error_response(StatusCode::BAD_GATEWAY, error.to_string()),
+        Err(error) => error_response_with_request_id(
+            StatusCode::BAD_GATEWAY,
+            error.to_string(),
+            &request_id,
+        ),
     }
 }
 
@@ -144,16 +166,27 @@ pub fn translate_chat_completions_request(
 
 /// Read the upstream success response and convert it to `chat.completion`
 /// format.
-async fn adapt_chat_completions_response(response: reqwest::Response) -> Result<Response> {
-    let (status, response_json) = extract_success_response_json(response).await?;
+async fn adapt_chat_completions_response(upstream: UpstreamExchange) -> Result<Response> {
+    let request_id = upstream.request_id;
+    let (status, response_json, upstream_request_id) =
+        extract_success_response_json(upstream.response).await?;
     let chat_completion = responses_to_chat_completion(&response_json)?;
 
     axum::http::Response::builder()
         .status(status)
         .header("content-type", "application/json; charset=utf-8")
-        .body(axum::body::Body::from(serde_json::to_vec(
-            &chat_completion,
-        )?))
+        .header("x-codex-proxy-request-id", &request_id)
+        .body(axum::body::Body::from(serde_json::to_vec(&chat_completion)?))
+        .map(|mut response| {
+            if let Some(upstream_request_id) = upstream_request_id {
+                if let Ok(value) = axum::http::HeaderValue::from_str(&upstream_request_id) {
+                    response
+                        .headers_mut()
+                        .insert("x-codex-proxy-upstream-request-id", value);
+                }
+            }
+            response
+        })
         .context("failed to build chat completions compatibility response")
 }
 

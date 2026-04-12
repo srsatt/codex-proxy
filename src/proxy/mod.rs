@@ -180,7 +180,7 @@ fn health_payload(
 }
 
 async fn list_models(State(state): State<ProxyAppState>, headers: HeaderMap) -> Response {
-    if !authorize(&headers, &state.fake_api_key) {
+    if !authorize_request("list_models", &headers, &state.fake_api_key) {
         return unauthorized_response();
     }
 
@@ -192,11 +192,12 @@ async fn get_model(
     Path(model_id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    if !authorize(&headers, &state.fake_api_key) {
+    if !authorize_request("get_model", &headers, &state.fake_api_key) {
         return unauthorized_response();
     }
 
     if !state.config.models.supports(&model_id) {
+        tracing::warn!(route_kind = "get_model", %model_id, "client requested unavailable model");
         return (
             StatusCode::NOT_FOUND,
             Json(json!({
@@ -217,7 +218,7 @@ async fn forward_v1_responses(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if !authorize(&headers, &state.fake_api_key) {
+    if !authorize_request("responses", &headers, &state.fake_api_key) {
         return unauthorized_response();
     }
 
@@ -229,7 +230,7 @@ async fn forward_v1_chat_completions(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if !authorize(&headers, &state.fake_api_key) {
+    if !authorize_request("chat_completions", &headers, &state.fake_api_key) {
         return unauthorized_response();
     }
 
@@ -239,6 +240,28 @@ async fn forward_v1_chat_completions(
 /// Return `true` if the request carries the correct fake API key.
 fn authorize(headers: &HeaderMap, expected_key: &str) -> bool {
     matches!(extract_api_key(headers), Some(candidate) if candidate == expected_key)
+}
+
+fn authorize_request(route_kind: &'static str, headers: &HeaderMap, expected_key: &str) -> bool {
+    let authorized = authorize(headers, expected_key);
+    if !authorized {
+        tracing::warn!(
+            route_kind,
+            auth_source = auth_source(headers),
+            "rejected request with invalid or missing fake API key"
+        );
+    }
+    authorized
+}
+
+fn auth_source(headers: &HeaderMap) -> &'static str {
+    if headers.contains_key(AUTHORIZATION) {
+        "authorization"
+    } else if headers.contains_key("x-api-key") {
+        "x-api-key"
+    } else {
+        "missing"
+    }
 }
 
 /// Build a 401 JSON response used when authentication fails.
