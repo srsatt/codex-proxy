@@ -522,6 +522,16 @@ pub fn prepare_request_body(
     object.remove("prompt_cache_retention");
     object.remove("safety_identifier");
 
+    // The OpenAI Responses API allows `input` to be a plain string (shorthand
+    // for a single user message), but the ChatGPT upstream requires a list.
+    // Coerce string inputs before normalization so downstream always sees an array.
+    if let Some(Value::String(s)) = object.get("input").cloned() {
+        object.insert(
+            "input".to_owned(),
+            json!([{"type": "message", "role": "user", "content": s}]),
+        );
+    }
+
     let input_stats = object
         .get_mut("input")
         .map(normalize_input)
