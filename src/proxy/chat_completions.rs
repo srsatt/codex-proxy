@@ -146,6 +146,16 @@ pub fn translate_chat_completions_request(
     copy_field(object, &mut responses_body, "prompt_cache_key");
     copy_field(object, &mut responses_body, "text");
 
+    // Standard OpenAI o-series clients send `reasoning_effort` as a top-level
+    // string (e.g. `"reasoning_effort": "high"`). The Responses API expects it
+    // nested as `reasoning.effort`. Translate only when no `reasoning` object
+    // was already copied above.
+    if !responses_body.contains_key("reasoning") {
+        if let Some(effort) = object.get("reasoning_effort").and_then(Value::as_str) {
+            responses_body.insert("reasoning".to_owned(), json!({"effort": effort}));
+        }
+    }
+
     if let Some(v) = object
         .get("max_output_tokens")
         .or_else(|| object.get("max_completion_tokens"))
@@ -261,10 +271,28 @@ pub fn responses_to_chat_completion(response: &Value) -> Result<Value> {
     } else {
         Value::String(content_parts.join(""))
     };
-    let finish_reason = if tool_calls.is_empty() {
-        "stop"
-    } else {
-        "tool_calls"
+
+    // Map the upstream `status` / `incomplete_details.reason` fields to the
+    // OpenAI `finish_reason` values clients expect.
+    let finish_reason = match response.get("status").and_then(Value::as_str) {
+        Some("incomplete") => {
+            match response
+                .get("incomplete_details")
+                .and_then(|d| d.get("reason"))
+                .and_then(Value::as_str)
+            {
+                Some("max_output_tokens") => "length",
+                Some("content_filter") => "content_filter",
+                _ => "stop",
+            }
+        }
+        _ => {
+            if tool_calls.is_empty() {
+                "stop"
+            } else {
+                "tool_calls"
+            }
+        }
     };
 
     let mut message = Map::new();
@@ -589,5 +617,99 @@ mod tests {
             "write_file"
         );
         assert_eq!(adapted["usage"]["total_tokens"], 15);
+    }
+
+    #[test]
+    fn translate_chat_completions_request_translates_reasoning_effort_to_nested_reasoning() {
+        let models = ModelsConfig::default();
+        let request = json!({
+            "model": "gpt-5.4",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "reasoning_effort": "high"
+        });
+
+        let prepared = translate_chat_completions_request(
+            serde_json::to_vec(&request).expect("request").as_slice(),
+            &Config::default().request_defaults,
+            &models,
+        )
+        .expect("prepared request");
+
+        assert_eq!(prepared.body["reasoning"]["effort"], "high");
+        assert!(prepared.body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn translate_chat_completions_request_explicit_reasoning_object_takes_priority_over_reasoning_effort(
+    ) {
+        let models = ModelsConfig::default();
+        // When both `reasoning` and `reasoning_effort` are present, the explicit
+        // `reasoning` object wins and `reasoning_effort` is ignored.
+        let request = json!({
+            "model": "gpt-5.4",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "reasoning": { "effort": "low" },
+            "reasoning_effort": "high"
+        });
+
+        let prepared = translate_chat_completions_request(
+            serde_json::to_vec(&request).expect("request").as_slice(),
+            &Config::default().request_defaults,
+            &models,
+        )
+        .expect("prepared request");
+
+        assert_eq!(prepared.body["reasoning"]["effort"], "low");
+    }
+
+    #[test]
+    fn responses_to_chat_completion_returns_length_finish_reason_when_truncated() {
+        let response = json!({
+            "id": "resp_trunc",
+            "created_at": 0,
+            "model": "gpt-5.4",
+            "status": "incomplete",
+            "incomplete_details": { "reason": "max_output_tokens" },
+            "output": [
+                { "type": "message", "content": [{ "type": "output_text", "text": "truncated" }] }
+            ],
+            "usage": { "input_tokens": 5, "output_tokens": 10, "total_tokens": 15 }
+        });
+
+        let adapted = responses_to_chat_completion(&response).expect("adapted response");
+        assert_eq!(adapted["choices"][0]["finish_reason"], "length");
+    }
+
+    #[test]
+    fn responses_to_chat_completion_returns_content_filter_finish_reason() {
+        let response = json!({
+            "id": "resp_filter",
+            "created_at": 0,
+            "model": "gpt-5.4",
+            "status": "incomplete",
+            "incomplete_details": { "reason": "content_filter" },
+            "output": [],
+            "usage": { "input_tokens": 5, "output_tokens": 0, "total_tokens": 5 }
+        });
+
+        let adapted = responses_to_chat_completion(&response).expect("adapted response");
+        assert_eq!(adapted["choices"][0]["finish_reason"], "content_filter");
+    }
+
+    #[test]
+    fn responses_to_chat_completion_returns_stop_for_completed_status() {
+        let response = json!({
+            "id": "resp_done",
+            "created_at": 0,
+            "model": "gpt-5.4",
+            "status": "completed",
+            "output": [
+                { "type": "message", "content": [{ "type": "output_text", "text": "done" }] }
+            ],
+            "usage": { "input_tokens": 5, "output_tokens": 3, "total_tokens": 8 }
+        });
+
+        let adapted = responses_to_chat_completion(&response).expect("adapted response");
+        assert_eq!(adapted["choices"][0]["finish_reason"], "stop");
     }
 }

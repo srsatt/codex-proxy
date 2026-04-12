@@ -520,6 +520,16 @@ fn ensure_object_field<'a>(
 ) -> Option<&'a mut serde_json::Map<String, Value>> {
     if !body.contains_key(key) {
         body.insert(key.to_owned(), Value::Object(serde_json::Map::new()));
+    } else if !body[key].is_object() {
+        // The client sent a non-object value (e.g. a plain string). Replace it
+        // with an empty object so defaults can be injected; without this the
+        // bad value would propagate to the upstream and cause an opaque 400.
+        tracing::warn!(
+            key,
+            actual_type = body[key].as_str().map(|_| "string").unwrap_or("non-string"),
+            "replacing non-object field with empty object to apply request defaults"
+        );
+        body.insert(key.to_owned(), Value::Object(serde_json::Map::new()));
     }
 
     body.get_mut(key)?.as_object_mut()
@@ -906,16 +916,39 @@ fn upstream_request_id_from_headers(headers: &reqwest::header::HeaderMap) -> Opt
         .map(ToOwned::to_owned)
 }
 
-/// If the upstream returned `{"detail":"Unsupported parameter: <name>"}`,
-/// return `Some(<name>)`. Returns `None` for any other error shape.
+/// If the upstream returned an unsupported-parameter error, return the
+/// parameter name. Returns `None` for any other error shape.
+///
+/// Recognised shapes:
+/// - `{"detail": "Unsupported parameter: <name>"}` (ChatGPT Codex backend)
+/// - `{"error": {"message": "Unsupported parameter: <name>", ...}}` (OpenAI standard)
 fn extract_unsupported_param(body: &[u8]) -> Option<String> {
     let value: Value = serde_json::from_slice(body).ok()?;
-    let detail = value.get("detail").and_then(Value::as_str)?;
-    let param = detail.strip_prefix("Unsupported parameter: ")?;
-    if param.is_empty() {
-        return None;
+
+    let try_extract = |s: &str| -> Option<String> {
+        let param = s.strip_prefix("Unsupported parameter: ")?;
+        if param.is_empty() { None } else { Some(param.to_owned()) }
+    };
+
+    // Shape 1: {"detail": "Unsupported parameter: X"}
+    if let Some(detail) = value.get("detail").and_then(Value::as_str) {
+        if let Some(param) = try_extract(detail) {
+            return Some(param);
+        }
     }
-    Some(param.to_owned())
+
+    // Shape 2: {"error": {"message": "Unsupported parameter: X", ...}}
+    if let Some(message) = value
+        .get("error")
+        .and_then(|e| e.get("message"))
+        .and_then(Value::as_str)
+    {
+        if let Some(param) = try_extract(message) {
+            return Some(param);
+        }
+    }
+
+    None
 }
 
 fn summarize_error_body(body: &[u8]) -> String {
@@ -1268,5 +1301,52 @@ data: {\"type\":\"response.done\",\"response\":{\"id\":\"resp_123\",\"object\":\
         assert_eq!(stats.dropped_orphaned_tool_outputs, 1);
         assert_eq!(stats.input_items_before, 3);
         assert_eq!(stats.input_items_after, 2);
+    }
+
+    #[test]
+    fn extract_unsupported_param_handles_detail_shape() {
+        let body = br#"{"detail":"Unsupported parameter: temperature"}"#;
+        assert_eq!(
+            extract_unsupported_param(body),
+            Some("temperature".to_owned())
+        );
+    }
+
+    #[test]
+    fn extract_unsupported_param_handles_openai_error_message_shape() {
+        let body = br#"{"error":{"message":"Unsupported parameter: top_p","type":"invalid_request_error"}}"#;
+        assert_eq!(
+            extract_unsupported_param(body),
+            Some("top_p".to_owned())
+        );
+    }
+
+    #[test]
+    fn extract_unsupported_param_returns_none_for_unrelated_errors() {
+        let body = br#"{"error":{"message":"Invalid model","type":"invalid_request_error"}}"#;
+        assert_eq!(extract_unsupported_param(body), None);
+    }
+
+    #[test]
+    fn prepare_request_body_replaces_non_object_reasoning_with_defaults() {
+        let mut config = Config::default();
+        config.request_defaults.reasoning_effort = Some("high".to_owned());
+
+        // Client sends `reasoning` as a string (wrong type). The proxy should
+        // replace it with an object and inject the configured default effort.
+        let request = json!({
+            "model": "gpt-5.4",
+            "reasoning": "high",
+            "input": [{ "type": "message", "role": "user", "content": "hello" }]
+        });
+
+        let prepared = prepare_request_body(
+            serde_json::to_vec(&request).expect("request").as_slice(),
+            &config.request_defaults,
+            &config.models,
+        )
+        .expect("prepared request");
+
+        assert_eq!(prepared.body["reasoning"]["effort"], "high");
     }
 }
