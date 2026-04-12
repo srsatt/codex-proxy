@@ -49,7 +49,20 @@ cargo build --release
 # Binary is at ./target/release/codex-proxy
 ```
 
-You can add it to your PATH or run it directly with `cargo run --release --`.
+To run `codex-proxy` from any terminal, symlink the built binary into
+`~/.local/bin` and add that directory to your `PATH`:
+
+```bash
+mkdir -p "$HOME/.local/bin"
+ln -sf "$PWD/target/release/codex-proxy" "$HOME/.local/bin/codex-proxy"
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
+export PATH="$HOME/.local/bin:$PATH"
+codex-proxy --help
+```
+
+If you use `bash`, add the export line to `~/.bashrc` instead of `~/.zshrc`.
+If you skip this step, replace `codex-proxy` below with
+`./target/release/codex-proxy`.
 
 ### Docker image
 
@@ -67,7 +80,7 @@ Run the auth flow once. This opens a browser window where you log in to
 ChatGPT and grant access. Tokens are saved to `./data/tokens.json`.
 
 ```bash
-cargo run --release -- auth
+codex-proxy auth
 ```
 
 After successful login the command prints your **proxy API key**:
@@ -84,7 +97,7 @@ Copy and save this key — you will use it as the API key in your coding tool.
 ### 2. Start the daemon
 
 ```bash
-cargo run --release -- start
+codex-proxy start
 ```
 
 The proxy now listens on `http://127.0.0.1:8317`.
