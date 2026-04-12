@@ -9,6 +9,7 @@
 //! | GET    | `/v1/models`              | Lists advertised models (OpenAI-compatible)          |
 //! | GET    | `/v1/models/{model_id}`   | Returns a single model object or 404                 |
 //! | POST   | `/v1/responses`           | Forwards requests to the ChatGPT Codex backend       |
+//! | POST   | `/v1/responses/compact`   | Forwards compaction requests to the Codex backend    |
 //! | POST   | `/v1/chat/completions`    | Non-streaming chat completions compatibility adapter |
 //!
 //! All routes except `/healthz` and `/readyz` require the fake API key in
@@ -41,7 +42,7 @@ use crate::{
 };
 
 use self::chat_completions::forward_chat_completions;
-use self::forwarding::{ForwardingState, forward_responses};
+use self::forwarding::{ForwardingState, forward_responses, forward_responses_compact};
 
 /// Shared state cloned into every Axum handler via [`axum::extract::State`].
 ///
@@ -110,6 +111,7 @@ pub fn router(state: ProxyAppState) -> Router {
         .route("/v1/models", get(list_models))
         .route("/v1/models/{model_id}", get(get_model))
         .route("/v1/responses", post(forward_v1_responses))
+        .route("/v1/responses/compact", post(forward_v1_responses_compact))
         .route("/v1/chat/completions", post(forward_v1_chat_completions))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
@@ -223,6 +225,18 @@ async fn forward_v1_responses(
     }
 
     forward_responses(&state.forwarding_state(), &headers, body).await
+}
+
+async fn forward_v1_responses_compact(
+    State(state): State<ProxyAppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if !authorize_request("compact", &headers, &state.fake_api_key) {
+        return unauthorized_response();
+    }
+
+    forward_responses_compact(&state.forwarding_state(), &headers, body).await
 }
 
 async fn forward_v1_chat_completions(

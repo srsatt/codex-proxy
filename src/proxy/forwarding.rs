@@ -40,6 +40,8 @@ use crate::{
 const UPSTREAM_CLIENT_REQUEST_ID_HEADER: &str = "x-client-request-id";
 const PROXY_REQUEST_ID_HEADER: &str = "x-codex-proxy-request-id";
 const PROXY_UPSTREAM_REQUEST_ID_HEADER: &str = "x-codex-proxy-upstream-request-id";
+// TODO: update once the real header is confirmed from debug logs — the ChatGPT backend
+// may not return `x-request-id` at all, in which case "missing" in logs is expected.
 const UPSTREAM_REQUEST_ID_HEADER: &str = "x-request-id";
 const MAX_ERROR_BODY_SNIPPET_CHARS: usize = 512;
 
@@ -147,10 +149,22 @@ pub async fn forward_responses(
         }
     };
 
+    let upstream_url = match upstream_responses_url(&state.config) {
+        Ok(url) => url,
+        Err(error) => {
+            return error_response_with_request_id(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error.to_string(),
+                &request_id,
+            );
+        }
+    };
+
     let upstream = match send_prepared_request(
         state,
         request_headers,
         &prepared_request,
+        upstream_url,
         "responses",
         &request_id,
     )
@@ -178,6 +192,86 @@ pub async fn forward_responses(
     }
 }
 
+/// Handler for `POST /v1/responses/compact`.
+///
+/// Forwards a compaction request to the upstream `/codex/responses/compact`
+/// endpoint. Does not inject `store` or `stream` since the compact endpoint
+/// does not accept those parameters. Streaming is not supported — requests
+/// with `stream: true` are rejected with 400.
+pub async fn forward_responses_compact(
+    state: &ForwardingState,
+    request_headers: &HeaderMap,
+    request_body: Bytes,
+) -> Response {
+    let request_id = uuid::Uuid::new_v4().to_string();
+
+    // Compact does not support streaming — reject early before parsing.
+    if let Ok(body_json) = serde_json::from_slice::<Value>(&request_body) {
+        if body_json.get("stream").and_then(Value::as_bool).unwrap_or(false) {
+            tracing::warn!(%request_id, route_kind = "compact", "client sent stream: true to compact endpoint");
+            return error_response_with_request_id(
+                StatusCode::BAD_REQUEST,
+                "streaming is not supported for compact responses",
+                &request_id,
+            );
+        }
+    }
+
+    let prepared_request = match prepare_compact_request_body(&request_body, &state.config.models) {
+        Ok(prepared_request) => prepared_request,
+        Err(error) => {
+            tracing::warn!(%request_id, route_kind = "compact", error = %error, "failed to normalize compact request");
+            return error_response_with_request_id(
+                StatusCode::BAD_REQUEST,
+                error.to_string(),
+                &request_id,
+            );
+        }
+    };
+
+    let upstream_url = match upstream_compact_url(&state.config) {
+        Ok(url) => url,
+        Err(error) => {
+            return error_response_with_request_id(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error.to_string(),
+                &request_id,
+            );
+        }
+    };
+
+    let upstream = match send_prepared_request(
+        state,
+        request_headers,
+        &prepared_request,
+        upstream_url,
+        "compact",
+        &request_id,
+    )
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            return error_response_with_request_id(
+                StatusCode::BAD_GATEWAY,
+                error.to_string(),
+                &request_id,
+            );
+        }
+    };
+
+    if !upstream.status.is_success() {
+        return map_upstream_error(upstream).await;
+    }
+
+    match handle_success_response(upstream, false).await {
+        Ok(response) => response,
+        Err(error) => {
+            error_response_with_request_id(StatusCode::BAD_GATEWAY, error.to_string(), &request_id)
+        }
+    }
+}
+
 /// Send a [`PreparedRequest`] to the upstream ChatGPT Codex backend.
 ///
 /// - Resolves/refreshes the current OAuth tokens.
@@ -188,6 +282,7 @@ pub async fn send_prepared_request(
     state: &ForwardingState,
     request_headers: &HeaderMap,
     prepared_request: &PreparedRequest,
+    upstream_url: Url,
     route_kind: &'static str,
     request_id: &str,
 ) -> Result<UpstreamExchange> {
@@ -199,26 +294,64 @@ pub async fn send_prepared_request(
         }
     };
     let token_status = tokens.auth_status().as_str();
-
-    let upstream_url = upstream_responses_url(&state.config)?;
     let transformation = &prepared_request.transformation;
+    let model = transformation.normalized_model.as_deref().unwrap_or("unknown");
+    let model_changed = transformation.original_model != transformation.normalized_model;
 
-    tracing::info!(
-        %request_id,
-        route_kind,
-        token_status,
-        model = transformation.normalized_model.as_deref().unwrap_or("unknown"),
-        original_model = transformation.original_model.as_deref().unwrap_or("unknown"),
-        model_changed = transformation.original_model != transformation.normalized_model,
-        original_stream = prepared_request.original_stream,
-        input_items_before = transformation.input_items_before,
-        input_items_after = transformation.input_items_after,
-        filtered_item_references = transformation.filtered_item_references,
-        stripped_item_ids = transformation.stripped_item_ids,
-        dropped_orphaned_tool_outputs = transformation.dropped_orphaned_tool_outputs,
-        include_defaults_added = transformation.include_defaults_added,
-        "forwarding request to upstream"
-    );
+    if model_changed {
+        tracing::info!(
+            %request_id,
+            route_kind,
+            token_status,
+            model,
+            original_model = transformation.original_model.as_deref().unwrap_or("unknown"),
+            model_changed = true,
+            original_stream = prepared_request.original_stream,
+            "forwarding request to upstream"
+        );
+    } else {
+        tracing::info!(
+            %request_id,
+            route_kind,
+            token_status,
+            model,
+            original_stream = prepared_request.original_stream,
+            "forwarding request to upstream"
+        );
+    }
+
+    let has_transformation = transformation.filtered_item_references > 0
+        || transformation.stripped_item_ids > 0
+        || transformation.dropped_orphaned_tool_outputs > 0
+        || transformation.include_defaults_added > 0;
+
+    if has_transformation {
+        tracing::info!(
+            %request_id,
+            route_kind,
+            input_items_before = transformation.input_items_before,
+            input_items_after = transformation.input_items_after,
+            filtered_item_references = transformation.filtered_item_references,
+            stripped_item_ids = transformation.stripped_item_ids,
+            dropped_orphaned_tool_outputs = transformation.dropped_orphaned_tool_outputs,
+            include_defaults_added = transformation.include_defaults_added,
+            "request transformation stats"
+        );
+    } else {
+        tracing::debug!(
+            %request_id,
+            route_kind,
+            input_items_before = transformation.input_items_before,
+            input_items_after = transformation.input_items_after,
+            filtered_item_references = transformation.filtered_item_references,
+            stripped_item_ids = transformation.stripped_item_ids,
+            dropped_orphaned_tool_outputs = transformation.dropped_orphaned_tool_outputs,
+            include_defaults_added = transformation.include_defaults_added,
+            "request transformation stats"
+        );
+    }
+
+    let request_start = std::time::Instant::now();
 
     // Mutable body so we can strip unsupported parameters and retry.
     let mut body = prepared_request.body.clone();
@@ -251,7 +384,24 @@ pub async fn send_prepared_request(
 
         let status = response.status();
         let upstream_request_id = upstream_request_id_from_headers(response.headers());
+
+        // Dump all upstream response headers at DEBUG level so operators can
+        // discover the real correlation header name if "missing" appears in logs.
+        // TODO: update UPSTREAM_REQUEST_ID_HEADER once real header confirmed from debug logs.
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            for (name, value) in response.headers() {
+                tracing::debug!(
+                    %request_id,
+                    route_kind,
+                    header_name = %name,
+                    header_value = value.to_str().unwrap_or("<non-utf8>"),
+                    "upstream response header"
+                );
+            }
+        }
+
         let upstream_headers = response.headers().clone();
+        let latency_ms = request_start.elapsed().as_millis();
 
         // On 400, check whether the upstream is rejecting a specific field.
         // If so, strip it and retry rather than surfacing the error to the client.
@@ -275,6 +425,8 @@ pub async fn send_prepared_request(
                 %request_id,
                 route_kind,
                 status = %status,
+                model,
+                latency_ms,
                 upstream_request_id = upstream_request_id.as_deref().unwrap_or("missing"),
                 "upstream request completed with non-success status"
             );
@@ -292,6 +444,8 @@ pub async fn send_prepared_request(
                 %request_id,
                 route_kind,
                 status = %status,
+                model,
+                latency_ms,
                 upstream_request_id = upstream_request_id.as_deref().unwrap_or("missing"),
                 "upstream request completed"
             );
@@ -300,6 +454,8 @@ pub async fn send_prepared_request(
                 %request_id,
                 route_kind,
                 status = %status,
+                model,
+                latency_ms,
                 upstream_request_id = upstream_request_id.as_deref().unwrap_or("missing"),
                 "upstream request completed with non-success status"
             );
@@ -382,6 +538,60 @@ pub fn prepare_request_body(
             stripped_item_ids: input_stats.stripped_item_ids,
             dropped_orphaned_tool_outputs: input_stats.dropped_orphaned_tool_outputs,
             include_defaults_added,
+        },
+    })
+}
+
+/// Parse and normalize a raw compact request body into a [`PreparedRequest`].
+///
+/// Unlike [`prepare_request_body`], this does **not** inject `store` or `stream`
+/// because the compact endpoint does not support those parameters. It does:
+/// - Canonicalize the model name via [`ModelsConfig::canonicalize`].
+/// - Strip `stream` (compact never streams), `store`, `prompt_cache_retention`,
+///   and `safety_identifier`.
+pub fn prepare_compact_request_body(body: &[u8], models: &ModelsConfig) -> Result<PreparedRequest> {
+    let mut body: Value =
+        serde_json::from_slice(body).context("compact request body must be valid JSON")?;
+    let original_model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+
+    let object = body
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("compact request body must be a JSON object"))?;
+
+    if let Some(normalized_model) = object
+        .get("model")
+        .and_then(Value::as_str)
+        .map(|model| models.canonicalize(model))
+    {
+        object.insert("model".to_owned(), Value::String(normalized_model));
+    }
+
+    // Fields the compact endpoint does not accept.
+    object.remove("stream");
+    object.remove("store");
+    object.remove("prompt_cache_retention");
+    object.remove("safety_identifier");
+
+    let normalized_model = object
+        .get("model")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+
+    Ok(PreparedRequest {
+        body: Value::Object(object.clone()),
+        original_stream: false,
+        transformation: TransformationSummary {
+            original_model,
+            normalized_model,
+            input_items_before: 0,
+            input_items_after: 0,
+            filtered_item_references: 0,
+            stripped_item_ids: 0,
+            dropped_orphaned_tool_outputs: 0,
+            include_defaults_added: 0,
         },
     })
 }
@@ -718,7 +928,7 @@ async fn get_or_refresh_tokens(state: &ForwardingState) -> Result<TokenStore> {
 
 /// Construct the full upstream URL by joining `responses_base_url` and
 /// `codex_responses_path` from config.
-fn upstream_responses_url(config: &Config) -> Result<Url> {
+pub(crate) fn upstream_responses_url(config: &Config) -> Result<Url> {
     let mut base_url = config.upstream.responses_base_url.clone();
     if !base_url.ends_with('/') {
         base_url.push('/');
@@ -727,6 +937,19 @@ fn upstream_responses_url(config: &Config) -> Result<Url> {
     let base = Url::parse(&base_url).context("invalid ChatGPT backend base URL")?;
     base.join(config.upstream.codex_responses_path.trim_start_matches('/'))
         .context("invalid Codex responses path")
+}
+
+/// Construct the full upstream URL by joining `responses_base_url` and
+/// `codex_compact_path` from config.
+fn upstream_compact_url(config: &Config) -> Result<Url> {
+    let mut base_url = config.upstream.responses_base_url.clone();
+    if !base_url.ends_with('/') {
+        base_url.push('/');
+    }
+
+    let base = Url::parse(&base_url).context("invalid ChatGPT backend base URL")?;
+    base.join(config.upstream.codex_compact_path.trim_start_matches('/'))
+        .context("invalid Codex compact path")
 }
 
 /// Convert a successful upstream response into an Axum [`Response`].

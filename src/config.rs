@@ -197,6 +197,9 @@ pub struct UpstreamConfig {
     /// Path appended to `responses_base_url` for the Codex responses endpoint.
     /// Default: `/codex/responses`.
     pub codex_responses_path: String,
+    /// Path appended to `responses_base_url` for the Codex compact endpoint.
+    /// Default: `/codex/responses/compact`.
+    pub codex_compact_path: String,
     /// OAuth authorization endpoint. Default: `https://auth.openai.com/oauth/authorize`.
     pub authorize_url: String,
     /// OAuth token endpoint. Default: `https://auth.openai.com/oauth/token`.
@@ -218,6 +221,7 @@ impl Default for UpstreamConfig {
         Self {
             responses_base_url: "https://chatgpt.com/backend-api".to_owned(),
             codex_responses_path: "/codex/responses".to_owned(),
+            codex_compact_path: "/codex/responses/compact".to_owned(),
             authorize_url: "https://auth.openai.com/oauth/authorize".to_owned(),
             token_url: "https://auth.openai.com/oauth/token".to_owned(),
             client_id: "app_EMoamEEZ73f0CkXaXp7hrann".to_owned(),

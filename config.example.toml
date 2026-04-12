@@ -19,6 +19,7 @@ timeout_seconds = 300
 [upstream]
 responses_base_url = "https://chatgpt.com/backend-api"
 codex_responses_path = "/codex/responses"
+codex_compact_path = "/codex/responses/compact"
 authorize_url = "https://auth.openai.com/oauth/authorize"
 token_url = "https://auth.openai.com/oauth/token"
 client_id = "app_EMoamEEZ73f0CkXaXp7hrann"

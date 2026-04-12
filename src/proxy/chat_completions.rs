@@ -21,6 +21,7 @@ use crate::config::{ModelsConfig, RequestDefaultsConfig};
 use super::forwarding::{
     ForwardingState, PreparedRequest, UpstreamExchange, error_response_with_request_id,
     extract_success_response_json, map_upstream_error, prepare_request_body, send_prepared_request,
+    upstream_responses_url,
 };
 
 /// Handler for `POST /v1/chat/completions`.
@@ -60,10 +61,22 @@ pub async fn forward_chat_completions(
         );
     }
 
+    let upstream_url = match upstream_responses_url(&state.config) {
+        Ok(url) => url,
+        Err(error) => {
+            return error_response_with_request_id(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error.to_string(),
+                &request_id,
+            );
+        }
+    };
+
     let upstream = match send_prepared_request(
         state,
         request_headers,
         &prepared_request,
+        upstream_url,
         "chat_completions",
         &request_id,
     )
