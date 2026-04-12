@@ -1,3 +1,22 @@
+//! Core request forwarding logic for `POST /v1/responses`.
+//!
+//! ## Request pipeline
+//!
+//! 1. **Parse** the raw request body as JSON.
+//! 2. **Normalize** the body via [`prepare_request_body`]:
+//!    - Canonicalize the model name via [`crate::config::ModelsConfig`].
+//!    - Force `store: false` and `stream: true` for upstream compatibility.
+//!    - Filter `item_reference` items from the `input` array.
+//!    - Strip `id` fields from remaining `input` items.
+//!    - Drop `function_call_output` items orphaned by reference filtering.
+//!    - Ensure `reasoning.encrypted_content` is in the `include` array.
+//! 3. **Forward** the prepared body to the ChatGPT Codex backend via
+//!    [`send_prepared_request`], attaching OAuth headers.
+//! 4. **Handle** the upstream response:
+//!    - Streaming: pipe bytes directly back to the client.
+//!    - Non-streaming: parse the SSE stream, extract the final response
+//!      object, and return it as JSON.
+
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -18,33 +37,57 @@ use crate::{
     state::{StoredAuthStatus, TokenStore, save_tokens, stored_auth_status},
 };
 
+/// State shared between the proxy router and the forwarding layer.
+///
+/// Cloned cheaply from [`super::ProxyAppState`] on each request via
+/// [`super::ProxyAppState::forwarding_state`].
 #[derive(Clone)]
 pub struct ForwardingState {
     pub config: Config,
     pub paths: AppPaths,
     pub client: Client,
+    /// Shared, mutable OAuth token store. Updated in place when a refresh
+    /// succeeds during a live request.
     pub tokens: Arc<RwLock<Option<TokenStore>>>,
 }
 
+/// A request body that has been parsed, normalized, and is ready to send
+/// upstream.
 #[derive(Debug, Clone)]
 pub struct PreparedRequest {
+    /// Normalized JSON body to be serialized and sent to the upstream API.
     pub body: Value,
+    /// Whether the *original* client request set `stream: true`.
+    /// Used to decide whether to pipe bytes or parse SSE in the response.
     pub original_stream: bool,
+    /// Audit trail of every transformation applied during normalization.
     pub transformation: TransformationSummary,
 }
 
+/// Records every transformation applied during [`prepare_request_body`].
+///
+/// Logged with each upstream request so operators can trace model normalization
+/// and input filtering without re-parsing the request body.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransformationSummary {
+    /// Model name as supplied by the client (before normalization).
     pub original_model: Option<String>,
+    /// Model name after [`crate::config::ModelsConfig::canonicalize`].
     pub normalized_model: Option<String>,
     pub input_items_before: usize,
     pub input_items_after: usize,
+    /// Number of `item_reference` items removed from the `input` array.
     pub filtered_item_references: usize,
+    /// Number of `id` fields stripped from surviving input items.
     pub stripped_item_ids: usize,
+    /// Number of `function_call_output` items dropped because their paired
+    /// `function_call` was removed by reference filtering.
     pub dropped_orphaned_tool_outputs: usize,
+    /// `true` when `reasoning.encrypted_content` was added to `include`.
     pub include_reasoning_added: bool,
 }
 
+/// Per-request statistics produced by [`normalize_input`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct InputNormalizationStats {
     pub input_items_before: usize,
@@ -54,6 +97,11 @@ pub struct InputNormalizationStats {
     pub dropped_orphaned_tool_outputs: usize,
 }
 
+/// Handler for `POST /v1/responses`.
+///
+/// Normalizes the request body, forwards it to the upstream Codex backend,
+/// and streams or collapses the SSE response according to the original
+/// client's `stream` flag.
 pub async fn forward_responses(
     state: &ForwardingState,
     request_headers: &HeaderMap,
@@ -80,6 +128,12 @@ pub async fn forward_responses(
     }
 }
 
+/// Send a [`PreparedRequest`] to the upstream ChatGPT Codex backend.
+///
+/// - Resolves/refreshes the current OAuth tokens.
+/// - Constructs upstream headers (Authorization, chatgpt-account-id, etc.).
+/// - Logs detailed request metadata including transformation stats.
+/// - Returns the raw upstream [`reqwest::Response`] for the caller to handle.
 pub async fn send_prepared_request(
     state: &ForwardingState,
     request_headers: &HeaderMap,
@@ -148,6 +202,16 @@ pub async fn send_prepared_request(
     Ok(response)
 }
 
+/// Parse and normalize a raw request body into a [`PreparedRequest`].
+///
+/// All stateless transformations are applied here so `send_prepared_request`
+/// only has to deal with network I/O. The transformations are:
+/// - Model canonicalization via [`ModelsConfig::canonicalize`].
+/// - `store: false` — prevents the backend from caching the conversation.
+/// - `stream: true` — the upstream always streams; the proxy un-streams when
+///   the client did not request streaming.
+/// - [`normalize_input`] — filters references and strips item IDs.
+/// - [`normalize_include`] — ensures `reasoning.encrypted_content` is included.
 pub fn prepare_request_body(body: &[u8], models: &ModelsConfig) -> Result<PreparedRequest> {
     let mut body: Value =
         serde_json::from_slice(body).context("request body must be valid JSON")?;
@@ -199,6 +263,15 @@ pub fn prepare_request_body(body: &[u8], models: &ModelsConfig) -> Result<Prepar
     })
 }
 
+/// Normalize the `input` array of a responses request in place.
+///
+/// Transformations applied (in order):
+/// 1. Remove items where `type == "item_reference"`.
+/// 2. Strip the `id` field from every surviving item.
+/// 3. Drop `function_call_output` items whose `call_id` no longer refers to
+///    a live `function_call` item (i.e. its pair was removed in step 1).
+///
+/// Returns statistics used for logging and test assertions.
 pub fn normalize_input(input: &mut Value) -> InputNormalizationStats {
     let Some(items) = input.as_array_mut() else {
         return InputNormalizationStats::default();
@@ -230,7 +303,8 @@ pub fn normalize_input(input: &mut Value) -> InputNormalizationStats {
         normalized_items.push(Value::Object(object));
     }
 
-    // Collect call_ids from all function_call items that survived filtering.
+    // Build the set of call_ids for function_call items that survived
+    // filtering. Used below to detect orphaned function_call_output items.
     let live_call_ids: std::collections::HashSet<String> = normalized_items
         .iter()
         .filter_map(|item| {
@@ -245,7 +319,9 @@ pub fn normalize_input(input: &mut Value) -> InputNormalizationStats {
         })
         .collect();
 
-    // Drop function_call_output items whose matching function_call was filtered out.
+    // Drop function_call_output items whose matching function_call was removed
+    // during item_reference filtering. Leaving them in causes an upstream API
+    // error because the backend cannot match them to a call.
     let mut dropped_orphaned_tool_outputs = 0;
     normalized_items.retain(|item| {
         let Some(obj) = item.as_object() else {
@@ -273,6 +349,11 @@ pub fn normalize_input(input: &mut Value) -> InputNormalizationStats {
     }
 }
 
+/// Ensure `"reasoning.encrypted_content"` is present in the `include` array.
+///
+/// Returns `true` if the entry had to be added, `false` if it was already
+/// there. The return value is recorded in [`TransformationSummary`] for
+/// logging.
 fn normalize_include(body: &mut serde_json::Map<String, Value>) -> bool {
     let mut include = body
         .get("include")
@@ -294,6 +375,19 @@ fn normalize_include(body: &mut serde_json::Map<String, Value>) -> bool {
     !had_reasoning_encrypted
 }
 
+/// Build the header map for the upstream ChatGPT Codex request.
+///
+/// Required headers:
+/// - `Authorization: Bearer <access_token>`
+/// - `chatgpt-account-id: <account_id>` (decoded from the JWT)
+/// - `OpenAI-Beta: <config.upstream.beta_header>`
+/// - `originator: <config.upstream.originator>`
+/// - `Accept: text/event-stream` (upstream always streams)
+/// - `Content-Type` (copied from the incoming client request)
+///
+/// Optional headers (added when `prompt_cache_key` is present in the body):
+/// - `conversation_id`
+/// - `session_id`
 pub fn build_upstream_headers(
     request_headers: &HeaderMap,
     tokens: &TokenStore,
@@ -350,6 +444,12 @@ pub fn build_upstream_headers(
     Ok(headers)
 }
 
+/// Return valid OAuth tokens, attempting a refresh if they are expiring or
+/// expired.
+///
+/// On a successful refresh the new tokens are persisted to `tokens.json` and
+/// the in-memory `Arc<RwLock<...>>` is updated so subsequent requests in the
+/// same daemon session do not trigger unnecessary refreshes.
 async fn get_or_refresh_tokens(state: &ForwardingState) -> Result<TokenStore> {
     let current = state.tokens.read().await.clone();
     let status = stored_auth_status(current.as_ref());
@@ -380,6 +480,8 @@ async fn get_or_refresh_tokens(state: &ForwardingState) -> Result<TokenStore> {
     Ok(refreshed_tokens)
 }
 
+/// Construct the full upstream URL by joining `responses_base_url` and
+/// `codex_responses_path` from config.
 fn upstream_responses_url(config: &Config) -> Result<Url> {
     let mut base_url = config.upstream.responses_base_url.clone();
     if !base_url.ends_with('/') {
@@ -391,6 +493,12 @@ fn upstream_responses_url(config: &Config) -> Result<Url> {
         .context("invalid Codex responses path")
 }
 
+/// Convert a successful upstream response into an Axum [`Response`].
+///
+/// - **Streaming** (`original_stream = true`): byte-streams the upstream
+///   SSE body directly to the client.
+/// - **Non-streaming**: reads the full SSE body, finds the `response.done`
+///   or `response.completed` event, and returns its `response` field as JSON.
 async fn handle_success_response(
     response: reqwest::Response,
     original_stream: bool,
@@ -424,6 +532,11 @@ async fn handle_success_response(
         .context("failed to build JSON proxy response")
 }
 
+/// Pass an upstream error response through to the client.
+///
+/// Special case: a `404` whose body contains usage-limit language is remapped
+/// to `429 Too Many Requests` so clients that understand rate-limit errors
+/// can back off automatically.
 pub async fn map_upstream_error(response: reqwest::Response) -> Response {
     let mut status = response.status();
     let headers = response_headers(response.headers());
@@ -463,6 +576,10 @@ pub async fn map_upstream_error(response: reqwest::Response) -> Response {
         })
 }
 
+/// Copy headers from a `reqwest` response into an Axum `HeaderMap`.
+///
+/// Inserts a default `Content-Type: text/event-stream` when the upstream
+/// response did not include one.
 fn response_headers(source: &reqwest::header::HeaderMap) -> HeaderMap {
     let mut headers = HeaderMap::new();
     for (name, value) in source {
@@ -479,6 +596,12 @@ fn response_headers(source: &reqwest::header::HeaderMap) -> HeaderMap {
     headers
 }
 
+/// Scan an SSE text body for the final response object.
+///
+/// Reads each `data: <json>` line and returns the `response` field of the
+/// first event whose `type` is `"response.done"` or `"response.completed"`.
+/// Returns `None` when no such event is found (e.g. if the stream was cut
+/// short).
 pub fn parse_sse_final_response(sse_text: &str) -> Option<Value> {
     for line in sse_text.lines() {
         let Some(data) = line.strip_prefix("data: ") else {
@@ -498,6 +621,7 @@ pub fn parse_sse_final_response(sse_text: &str) -> Option<Value> {
     None
 }
 
+/// Build a JSON error response with a `proxy_error` type envelope.
 pub fn error_response(status: StatusCode, message: impl Into<String>) -> Response {
     let payload = json!({
         "error": {

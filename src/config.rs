@@ -1,3 +1,18 @@
+//! Runtime configuration loaded from `config.toml`.
+//!
+//! [`Config`] is the root container. If `config.toml` does not exist when the
+//! daemon starts, it is written with the compiled-in defaults so users have a
+//! concrete starting point for customisation.
+//!
+//! ## Sections
+//! | TOML key            | Rust type                   | Purpose                          |
+//! |---------------------|-----------------------------|----------------------------------|
+//! | `[server]`          | [`ServerConfig`]            | Bind address and log level        |
+//! | `[auth]`            | [`AuthConfig`]              | OAuth callback settings           |
+//! | `[upstream]`        | [`UpstreamConfig`]          | ChatGPT backend URLs & credentials |
+//! | `[request_defaults]`| [`RequestDefaultsConfig`]   | Default fields injected into every upstream request |
+//! | `[models]`          | [`ModelsConfig`]            | Advertised model list and aliases |
+
 use std::{collections::BTreeMap, fs, path::Path};
 
 use anyhow::Result;
@@ -5,6 +20,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::{constants::CALLBACK_PATH, paths::AppPaths, storage::write_string};
 
+/// Root configuration container, deserialized from `config.toml`.
+///
+/// All sub-sections implement `Default` so missing TOML sections fall back to
+/// sensible values without requiring a full config file on first run.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -16,6 +35,11 @@ pub struct Config {
 }
 
 impl Config {
+    /// Load configuration from `paths.config_path`.
+    ///
+    /// If the file does not exist, a default [`Config`] is written to disk and
+    /// returned. This ensures the user always has an editable `config.toml`
+    /// after the first run.
     pub fn load_or_create(paths: &AppPaths) -> Result<Self> {
         paths.ensure_runtime_layout()?;
 
@@ -31,6 +55,12 @@ impl Config {
         Ok(config)
     }
 
+    /// Read only the `server.log_filter` value from `config_path`.
+    ///
+    /// This is used during startup *before* the rest of the config is parsed so
+    /// that structured logging can be initialised at the correct level without
+    /// having to fully validate the entire config file first.
+    /// Returns the compiled-in default when the file is missing or unparseable.
     pub fn load_log_filter(config_path: &Path) -> String {
         if !config_path.exists() {
             return Self::default().server.log_filter;
@@ -44,11 +74,15 @@ impl Config {
     }
 }
 
+/// HTTP server settings for the local proxy.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ServerConfig {
+    /// Host the proxy TCP listener binds on. Default: `127.0.0.1`.
     pub bind: String,
+    /// Port the proxy TCP listener binds on. Default: `8317`.
     pub port: u16,
+    /// `tracing` filter directive (same syntax as `RUST_LOG`). Default: `info`.
     pub log_filter: String,
 }
 
@@ -62,16 +96,24 @@ impl Default for ServerConfig {
     }
 }
 
+/// OAuth callback listener settings used during `codex-proxy auth`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AuthConfig {
+    /// Host the temporary OAuth callback server binds on. Default: `127.0.0.1`.
     pub callback_host: String,
+    /// Port the temporary OAuth callback server listens on. Default: `1455`.
     pub callback_port: u16,
+    /// Whether to attempt to open the authorization URL in the system browser
+    /// automatically. Default: `true`.
     pub open_browser: bool,
+    /// Seconds to wait for the browser to complete the OAuth flow before the
+    /// callback listener times out. Default: `300`.
     pub timeout_seconds: u64,
 }
 
 impl AuthConfig {
+    /// Build the full OAuth `redirect_uri` from the callback host and port.
     pub fn redirect_uri(&self) -> String {
         format!(
             "http://{}:{}{}",
@@ -91,16 +133,31 @@ impl Default for AuthConfig {
     }
 }
 
+/// URLs, credentials, and headers for the upstream ChatGPT / OpenAI endpoints.
+///
+/// These defaults are derived from the TypeScript reference implementation and
+/// should not need to change under normal circumstances.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UpstreamConfig {
+    /// Base URL of the ChatGPT backend API. Default: `https://chatgpt.com/backend-api`.
     pub responses_base_url: String,
+    /// Path appended to `responses_base_url` for the Codex responses endpoint.
+    /// Default: `/codex/responses`.
     pub codex_responses_path: String,
+    /// OAuth authorization endpoint. Default: `https://auth.openai.com/oauth/authorize`.
     pub authorize_url: String,
+    /// OAuth token endpoint. Default: `https://auth.openai.com/oauth/token`.
     pub token_url: String,
+    /// OAuth `client_id` for the Codex CLI application.
     pub client_id: String,
+    /// OAuth scopes requested during authorization.
     pub scope: String,
+    /// Value sent in the `originator` header and as a query parameter during
+    /// authorization. Identifies this client to the backend.
     pub originator: String,
+    /// Value sent in the `OpenAI-Beta` header to opt in to the experimental
+    /// responses API. Default: `responses=experimental`.
     pub beta_header: String,
 }
 
@@ -119,16 +176,29 @@ impl Default for UpstreamConfig {
     }
 }
 
+/// Default fields injected into every outgoing request by the proxy.
+///
+/// These mirror the options used by the TypeScript reference implementation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RequestDefaultsConfig {
+    /// Items to append to the `include` array on every request.
+    /// Defaults to `["reasoning.encrypted_content"]` so reasoning tokens are
+    /// always returned.
     pub include: Vec<String>,
+    /// Optional default for the `reasoning.effort` field (`"low"`, `"medium"`,
+    /// `"high"`). Omitted when `None`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// Optional default for the `reasoning.summary` field. Omitted when `None`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_summary: Option<String>,
+    /// Optional default for the `text.format.verbosity` field. Omitted when `None`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text_verbosity: Option<String>,
+    /// When `true` (the default), `function_call_output` items whose paired
+    /// `function_call` was removed during `item_reference` filtering are
+    /// preserved. When `false`, they are dropped to avoid upstream API errors.
     pub preserve_orphaned_function_call_outputs: bool,
 }
 
@@ -144,15 +214,39 @@ impl Default for RequestDefaultsConfig {
     }
 }
 
+/// Model advertisement and normalisation configuration.
+///
+/// Clients send model names that may differ from what the upstream API expects.
+/// `ModelsConfig` provides a two-level lookup:
+/// 1. **Advertised list** — exact-match (case-insensitive) against known names.
+/// 2. **Aliases map** — maps alternative names (e.g. `openai/gpt-5.4`) to
+///    canonical upstream names.
+///
+/// If neither lookup matches, the request is forwarded with the `fallback`
+/// model name.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ModelsConfig {
+    /// Model IDs returned by `GET /v1/models` and accepted by the proxy.
     pub advertised: Vec<String>,
+    /// Map of alternative / prefixed names to their canonical upstream names.
+    /// Keys are case-insensitive during lookup.
     pub aliases: BTreeMap<String, String>,
+    /// Model name used when no advertised entry or alias matches the client's
+    /// request. Default: `"gpt-5.4"`.
     pub fallback: String,
 }
 
 impl ModelsConfig {
+    /// Resolve a client-supplied `model` string to the canonical upstream name.
+    ///
+    /// Lookup order:
+    /// 1. Exact (case-insensitive) match in `advertised`.
+    /// 2. Strip any provider prefix (`openai/` → `gpt-5.4-mini`) and retry
+    ///    step 1.
+    /// 3. Exact (case-insensitive) match in `aliases`.
+    /// 4. Strip provider prefix and retry step 3.
+    /// 5. Return `fallback`.
     pub fn canonicalize(&self, model: &str) -> String {
         let trimmed = model.trim();
         let stripped = trimmed.rsplit('/').next().unwrap_or(trimmed).trim();
@@ -173,6 +267,10 @@ impl ModelsConfig {
         self.fallback.clone()
     }
 
+    /// Returns `true` if `model` is in the `advertised` list (case-insensitive).
+    ///
+    /// Used by `GET /v1/models/{model_id}` to determine whether to return 200
+    /// or 404.
     pub fn supports(&self, model: &str) -> bool {
         self.find_advertised(model).is_some()
     }

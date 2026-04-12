@@ -1,3 +1,19 @@
+//! Local OpenAI-compatible proxy server.
+//!
+//! Exposes the following HTTP routes:
+//!
+//! | Method | Path                      | Description                                          |
+//! |--------|---------------------------|------------------------------------------------------|
+//! | GET    | `/healthz`                | Returns rich JSON health/status payload              |
+//! | GET    | `/readyz`                 | 200 when forwarding is ready, 503 otherwise          |
+//! | GET    | `/v1/models`              | Lists advertised models (OpenAI-compatible)          |
+//! | GET    | `/v1/models/{model_id}`   | Returns a single model object or 404                 |
+//! | POST   | `/v1/responses`           | Forwards requests to the ChatGPT Codex backend       |
+//! | POST   | `/v1/chat/completions`    | Non-streaming chat completions compatibility adapter |
+//!
+//! All routes except `/healthz` and `/readyz` require the fake API key in
+//! either `Authorization: Bearer <key>` or `x-api-key: <key>`.
+
 mod chat_completions;
 mod forwarding;
 
@@ -27,12 +43,22 @@ use crate::{
 use self::chat_completions::forward_chat_completions;
 use self::forwarding::{ForwardingState, forward_responses};
 
+/// Shared state cloned into every Axum handler via [`axum::extract::State`].
+///
+/// Tokens are wrapped in `Arc<RwLock<...>>` so that background refresh
+/// (performed inside request handlers) can update them without rebuilding
+/// the entire state.
 #[derive(Debug, Clone)]
 pub struct ProxyAppState {
+    /// Full runtime configuration loaded from `config.toml`.
     pub config: Config,
+    /// Resolved filesystem paths for config and data files.
     pub paths: AppPaths,
+    /// Fake API key that clients must present to use the proxy.
     pub fake_api_key: String,
+    /// Shared HTTP client reused across all upstream requests.
     pub client: Client,
+    /// Current OAuth tokens, updated in place when a refresh succeeds.
     pub tokens: Arc<RwLock<Option<TokenStore>>>,
 }
 
@@ -52,6 +78,7 @@ impl ProxyAppState {
         }
     }
 
+    /// Extract the subset of state needed by the forwarding layer.
     fn forwarding_state(&self) -> ForwardingState {
         ForwardingState {
             config: self.config.clone(),
@@ -112,6 +139,11 @@ async fn readyz(State(state): State<ProxyAppState>) -> Response {
     (status, Json(payload)).into_response()
 }
 
+/// Build the JSON payload returned by `/healthz` and `/readyz`.
+///
+/// `forwarding_ready` is `true` only when all three preconditions hold:
+/// a fake API key is configured, a valid or expiring OAuth token exists, and
+/// the responses route is ready. This is used by `readyz` to gate traffic.
 fn health_payload(
     tokens: Option<&TokenStore>,
     fake_api_key_configured: bool,
@@ -201,10 +233,12 @@ async fn forward_v1_chat_completions(
     forward_chat_completions(&state.forwarding_state(), &headers, body).await
 }
 
+/// Return `true` if the request carries the correct fake API key.
 fn authorize(headers: &HeaderMap, expected_key: &str) -> bool {
     matches!(extract_api_key(headers), Some(candidate) if candidate == expected_key)
 }
 
+/// Build a 401 JSON response used when authentication fails.
 fn unauthorized_response() -> Response {
     (
         StatusCode::UNAUTHORIZED,
@@ -243,6 +277,13 @@ fn model_payload(model_id: &str) -> Value {
     })
 }
 
+/// Extract the API key from the request headers.
+///
+/// Supports two formats:
+/// - `Authorization: Bearer <key>` (case-insensitive `bearer` prefix)
+/// - `x-api-key: <key>`
+///
+/// `Authorization` is checked first.
 fn extract_api_key(headers: &HeaderMap) -> Option<String> {
     if let Some(rest) = headers
         .get(AUTHORIZATION)

@@ -13,3 +13,7 @@ examples/**
 # plans
 plans/**
 /plans/**
+
+# codex-api
+codex-api/**
+/codex-api/**

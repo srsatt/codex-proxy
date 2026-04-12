@@ -1,3 +1,13 @@
+//! Local OAuth callback HTTP server.
+//!
+//! Spins up a temporary Axum server on `host:port` that listens for a single
+//! `GET /auth/callback?code=...&state=...` redirect from the OAuth provider,
+//! validates the `state` parameter for CSRF protection, and delivers the
+//! authorization code to the caller via a oneshot channel.
+//!
+//! The server shuts itself down after the code is received or the timeout
+//! elapses.
+
 use std::{
     sync::{Arc, Mutex},
     time::Duration,
@@ -16,18 +26,30 @@ use tokio::{net::TcpListener, sync::oneshot, time::timeout};
 
 use crate::constants::{CALLBACK_PATH, OAUTH_SUCCESS_HTML};
 
+/// Shared state injected into the Axum callback handler.
 #[derive(Clone)]
 struct CallbackAppState {
+    /// The `state` value generated during authorization URL construction.
+    /// Used to verify CSRF protection on the callback.
     expected_state: String,
+    /// Oneshot sender wrapped in a `Mutex<Option<...>>` so it can be taken
+    /// exactly once even when the handler is called concurrently.
     code_tx: Arc<Mutex<Option<oneshot::Sender<String>>>>,
 }
 
+/// Query parameters extracted from the OAuth callback redirect.
 #[derive(Debug, Deserialize)]
 struct CallbackQuery {
     code: Option<String>,
     state: Option<String>,
 }
 
+/// Bind a local HTTP server on `host:port`, wait for the OAuth callback, and
+/// return the authorization code.
+///
+/// The server shuts down gracefully after the code is delivered. If no
+/// callback is received within `timeout_window`, an error is returned and the
+/// server is dropped.
 pub async fn wait_for_authorization_code(
     host: &str,
     port: u16,
@@ -74,6 +96,11 @@ pub async fn wait_for_authorization_code(
     Ok(code)
 }
 
+/// Axum route handler for `GET /auth/callback`.
+///
+/// Validates `state` (CSRF check), extracts `code`, and delivers it through
+/// the oneshot channel. Returns the success HTML page on success so the user
+/// sees a confirmation message in their browser.
 async fn handle_callback(
     State(state): State<CallbackAppState>,
     Query(query): Query<CallbackQuery>,

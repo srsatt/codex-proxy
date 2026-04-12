@@ -1,3 +1,14 @@
+//! `codex-proxy auth` command handler.
+//!
+//! Runs the interactive ChatGPT OAuth PKCE flow:
+//! 1. Check whether stored tokens are still valid (skip browser login if so).
+//! 2. Attempt a token refresh for expiring/expired tokens (skip browser if ok).
+//! 3. Build an authorization URL and open the system browser.
+//! 4. Start a local callback server and wait for the authorization code.
+//! 5. Exchange the code for tokens and persist them to `tokens.json`.
+//!
+//! Use `--force` to restart the browser flow even when stored tokens are valid.
+
 use std::time::Duration;
 
 use anyhow::Result;

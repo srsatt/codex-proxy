@@ -1,3 +1,13 @@
+//! `POST /v1/chat/completions` compatibility adapter.
+//!
+//! Translates OpenAI chat-completions requests into the ChatGPT Codex
+//! responses format, forwards them via [`super::forwarding`], and converts
+//! the responses-format reply back into an OpenAI-compatible
+//! `chat.completion` object.
+//!
+//! **Limitations**: streaming is not supported. Requests with `stream: true`
+//! receive a 501 Not Implemented. Use `POST /v1/responses` for streaming.
+
 use anyhow::{Context, Result, anyhow, bail};
 use axum::{
     body::Bytes,
@@ -13,6 +23,12 @@ use super::forwarding::{
     send_prepared_request,
 };
 
+/// Handler for `POST /v1/chat/completions`.
+///
+/// 1. Translates the chat-completions request body to the responses format.
+/// 2. Rejects streaming requests with 501.
+/// 3. Forwards via [`send_prepared_request`].
+/// 4. Converts the upstream response to a `chat.completion` object.
 pub async fn forward_chat_completions(
     state: &ForwardingState,
     request_headers: &HeaderMap,
@@ -53,6 +69,15 @@ pub async fn forward_chat_completions(
     }
 }
 
+/// Translate a raw `POST /v1/chat/completions` body into a [`PreparedRequest`]
+/// targeting the responses API.
+///
+/// Field mappings:
+/// - `messages` → `input` (via [`convert_chat_messages`])
+/// - `max_completion_tokens` or `max_tokens` → `max_output_tokens`
+/// - `tools`, `tool_choice`, `reasoning`, `include`, `prompt_cache_key`,
+///   `text` are copied verbatim.
+/// - `stream` is preserved (used to detect and reject streaming requests).
 pub fn translate_chat_completions_request(
     body: &[u8],
     models: &ModelsConfig,
@@ -111,6 +136,7 @@ pub fn translate_chat_completions_request(
     )
 }
 
+/// Read the upstream JSON response and convert it to `chat.completion` format.
 async fn adapt_chat_completions_response(response: reqwest::Response) -> Result<Response> {
     let status = response.status();
     let response_json: Value = response
@@ -128,6 +154,14 @@ async fn adapt_chat_completions_response(response: reqwest::Response) -> Result<
         .context("failed to build chat completions compatibility response")
 }
 
+/// Convert a responses-API response object into an OpenAI `chat.completion`.
+///
+/// Output items are mapped as follows:
+/// - `type: "message"` → assistant message content (text parts concatenated).
+/// - `type: "function_call"` → tool call entry in `choices[0].message.tool_calls`.
+///
+/// `finish_reason` is `"tool_calls"` when any function call items are present,
+/// otherwise `"stop"`.
 pub fn responses_to_chat_completion(response: &Value) -> Result<Value> {
     let output = response
         .get("output")
@@ -240,6 +274,14 @@ pub fn responses_to_chat_completion(response: &Value) -> Result<Value> {
     }))
 }
 
+/// Convert a chat-completions `messages` array to a responses `input` array.
+///
+/// Role mappings:
+/// - `system` / `developer` → `type: "message"`, role becomes `"developer"`.
+/// - `user` → `type: "message"`.
+/// - `assistant` → `type: "message"` for text content, plus one
+///   `type: "function_call"` item per tool call.
+/// - `tool` → `type: "function_call_output"`, `call_id` from `tool_call_id`.
 fn convert_chat_messages(messages: &[Value]) -> Result<Vec<Value>> {
     let mut converted = Vec::with_capacity(messages.len());
 
@@ -323,11 +365,15 @@ fn convert_chat_messages(messages: &[Value]) -> Result<Vec<Value>> {
     Ok(converted)
 }
 
+/// Extract required string content from a message's `content` field.
+/// Returns an error if the content is null or empty.
 fn extract_message_content(content: Option<&Value>) -> Result<String> {
     extract_optional_message_content(content)?
         .ok_or_else(|| anyhow!("chat completion message content must not be empty"))
 }
 
+/// Extract optional string content, returning `Ok(None)` for null/missing
+/// and `Ok(Some(...))` for non-empty string or array of text parts.
 fn extract_optional_message_content(content: Option<&Value>) -> Result<Option<String>> {
     let Some(content) = content else {
         return Ok(None);
@@ -368,6 +414,7 @@ fn extract_optional_message_content(content: Option<&Value>) -> Result<Option<St
     }
 }
 
+/// Copy a field from `source` to `target` if it exists.
 fn copy_field(source: &Map<String, Value>, target: &mut Map<String, Value>, key: &str) {
     if let Some(value) = source.get(key) {
         target.insert(key.to_owned(), value.clone());

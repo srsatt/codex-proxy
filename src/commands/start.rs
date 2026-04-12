@@ -1,3 +1,8 @@
+//! `codex-proxy start` command handler.
+//!
+//! Loads configuration, ensures the fake API key exists, optionally refreshes
+//! expiring tokens, and launches the Axum proxy server.
+
 use anyhow::Result;
 use reqwest::Client;
 use tracing::{info, warn};
@@ -11,6 +16,12 @@ use crate::{
     state::{StoredAuthStatus, ensure_fake_api_key, load_tokens, save_tokens, stored_auth_status},
 };
 
+/// Entry point for `codex-proxy start`.
+///
+/// 1. Loads (or creates) `config.toml`.
+/// 2. Ensures the fake API key is generated and stored.
+/// 3. Attempts a token refresh if stored tokens are expiring or expired.
+/// 4. Starts the Axum HTTP server and blocks until it exits.
 pub async fn run(paths: AppPaths, args: StartArgs) -> Result<()> {
     paths.ensure_runtime_layout()?;
 

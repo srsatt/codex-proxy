@@ -1,6 +1,19 @@
+//! Compile-time constants shared across the codebase.
+
+/// URL path that the local OAuth callback server listens on.
+/// Must match the `redirect_uri` registered with the OAuth provider.
 pub const CALLBACK_PATH: &str = "/auth/callback";
+
+/// Prefix applied to every generated fake API key so they are visually
+/// distinguishable from real OpenAI keys (e.g. `sk-codex-proxy-<hex>`).
 pub const FAKE_API_KEY_PREFIX: &str = "sk-codex-proxy-";
+
+/// How many seconds before token expiry the daemon considers a token
+/// "expiring" and proactively attempts a refresh.
 pub const TOKEN_REFRESH_WINDOW_SECONDS: i64 = 300;
+
+/// Static HTML page returned to the browser after a successful OAuth callback.
+/// Instructs the user to return to the terminal.
 pub const OAUTH_SUCCESS_HTML: &str = r#"<!doctype html>
 <html lang="en">
   <head>

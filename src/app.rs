@@ -1,3 +1,6 @@
+//! Application entry point: parses CLI arguments, initialises structured
+//! logging, and dispatches to the appropriate command handler.
+
 use anyhow::Result;
 use clap::Parser;
 use tracing_subscriber::{EnvFilter, fmt};
@@ -9,6 +12,11 @@ use crate::{
     paths::AppPaths,
 };
 
+/// Parse CLI arguments, set up tracing, then run `start` or `auth`.
+///
+/// Logging is bootstrapped from the `log_filter` field in `config.toml`
+/// (read cheaply without a full config parse) or from the `RUST_LOG`
+/// environment variable, whichever is set.
 pub async fn run() -> Result<()> {
     let cli = Cli::parse();
     let paths = AppPaths::new(cli.config_path, cli.data_dir);
@@ -21,6 +29,12 @@ pub async fn run() -> Result<()> {
     }
 }
 
+/// Initialise the global `tracing` subscriber.
+///
+/// Priority order:
+/// 1. `RUST_LOG` environment variable (overrides config).
+/// 2. `server.log_filter` from `config.toml`.
+/// 3. Hard-coded fallback `"codex_proxy=info,info"`.
 fn init_tracing(config_log_filter: &str) {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         let directive = if config_log_filter.trim().is_empty() {
