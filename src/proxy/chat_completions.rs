@@ -20,8 +20,7 @@ use crate::config::{ModelsConfig, RequestDefaultsConfig};
 
 use super::forwarding::{
     ForwardingState, PreparedRequest, UpstreamExchange, error_response_with_request_id,
-    extract_success_response_json, map_upstream_error, prepare_request_body,
-    send_prepared_request,
+    extract_success_response_json, map_upstream_error, prepare_request_body, send_prepared_request,
 };
 
 /// Handler for `POST /v1/chat/completions`.
@@ -86,11 +85,9 @@ pub async fn forward_chat_completions(
 
     match adapt_chat_completions_response(upstream).await {
         Ok(response) => response,
-        Err(error) => error_response_with_request_id(
-            StatusCode::BAD_GATEWAY,
-            error.to_string(),
-            &request_id,
-        ),
+        Err(error) => {
+            error_response_with_request_id(StatusCode::BAD_GATEWAY, error.to_string(), &request_id)
+        }
     }
 }
 
@@ -176,14 +173,16 @@ async fn adapt_chat_completions_response(upstream: UpstreamExchange) -> Result<R
         .status(status)
         .header("content-type", "application/json; charset=utf-8")
         .header("x-codex-proxy-request-id", &request_id)
-        .body(axum::body::Body::from(serde_json::to_vec(&chat_completion)?))
+        .body(axum::body::Body::from(serde_json::to_vec(
+            &chat_completion,
+        )?))
         .map(|mut response| {
-            if let Some(upstream_request_id) = upstream_request_id {
-                if let Ok(value) = axum::http::HeaderValue::from_str(&upstream_request_id) {
-                    response
-                        .headers_mut()
-                        .insert("x-codex-proxy-upstream-request-id", value);
-                }
+            if let Some(upstream_request_id) = upstream_request_id
+                && let Ok(value) = axum::http::HeaderValue::from_str(&upstream_request_id)
+            {
+                response
+                    .headers_mut()
+                    .insert("x-codex-proxy-upstream-request-id", value);
             }
             response
         })

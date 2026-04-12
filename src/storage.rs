@@ -39,6 +39,7 @@ where
     ensure_parent_dir(path)?;
     let content = serde_json::to_string_pretty(value)?;
     fs::write(path, content)?;
+    set_owner_only_permissions(path)?;
     Ok(())
 }
 
@@ -46,6 +47,7 @@ where
 pub fn write_string(path: &Path, value: &str) -> Result<()> {
     ensure_parent_dir(path)?;
     fs::write(path, value)?;
+    set_owner_only_permissions(path)?;
     Ok(())
 }
 
@@ -63,4 +65,18 @@ fn ensure_parent_dir(path: &Path) -> Result<()> {
 #[allow(dead_code)]
 pub fn normalize_path(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+#[cfg(unix)]
+fn set_owner_only_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let permissions = fs::Permissions::from_mode(0o600);
+    fs::set_permissions(path, permissions)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_owner_only_permissions(_path: &Path) -> Result<()> {
+    Ok(())
 }

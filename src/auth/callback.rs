@@ -152,7 +152,9 @@ async fn handle_callback(
     let code_tx = match sender.take() {
         Some(code_tx) => code_tx,
         None => {
-            warn!("received duplicate OAuth callback after authorization code was already consumed");
+            warn!(
+                "received duplicate OAuth callback after authorization code was already consumed"
+            );
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Authorization code already consumed".to_owned(),

@@ -230,11 +230,28 @@ fn generate_fake_api_key() -> Result<String> {
         .trim()
         .to_owned();
 
+    validate_fake_api_key_suffix(&suffix)?;
+
+    Ok(format!("{FAKE_API_KEY_PREFIX}{suffix}"))
+}
+
+fn validate_fake_api_key_suffix(suffix: &str) -> Result<()> {
     if suffix.is_empty() {
         bail!("openssl returned an empty fake API key payload");
     }
 
-    Ok(format!("{FAKE_API_KEY_PREFIX}{suffix}"))
+    if suffix.len() != 48 {
+        bail!(
+            "openssl returned a fake API key payload with unexpected length {}; expected 48 hex characters",
+            suffix.len()
+        );
+    }
+
+    if !suffix.chars().all(|char| char.is_ascii_hexdigit()) {
+        bail!("openssl returned a fake API key payload containing non-hex characters");
+    }
+
+    Ok(())
 }
 
 fn default_token_type() -> String {
@@ -293,5 +310,21 @@ mod tests {
         assert_eq!(loaded.refresh_token, tokens.refresh_token);
         assert_eq!(loaded.account_id, tokens.account_id);
         assert_eq!(loaded.scope, tokens.scope);
+    }
+
+    #[test]
+    fn validate_fake_api_key_suffix_accepts_expected_hex_payload() {
+        validate_fake_api_key_suffix("0123456789abcdef0123456789abcdef0123456789abcdef")
+            .expect("valid suffix");
+    }
+
+    #[test]
+    fn validate_fake_api_key_suffix_rejects_invalid_payloads() {
+        assert!(validate_fake_api_key_suffix("").is_err());
+        assert!(validate_fake_api_key_suffix("short").is_err());
+        assert!(
+            validate_fake_api_key_suffix("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz")
+                .is_err()
+        );
     }
 }

@@ -161,11 +161,9 @@ pub async fn forward_responses(
 
     match handle_success_response(upstream, prepared_request.original_stream).await {
         Ok(response) => response,
-        Err(error) => error_response_with_request_id(
-            StatusCode::BAD_GATEWAY,
-            error.to_string(),
-            &request_id,
-        ),
+        Err(error) => {
+            error_response_with_request_id(StatusCode::BAD_GATEWAY, error.to_string(), &request_id)
+        }
     }
 }
 
@@ -434,19 +432,17 @@ fn apply_request_defaults(
             .as_deref()
             .is_some_and(|value| !value.trim().is_empty());
 
-    if has_reasoning_defaults {
-        if let Some(reasoning) = ensure_object_field(body, "reasoning") {
-            insert_default_string_field(
-                reasoning,
-                "effort",
-                request_defaults.reasoning_effort.as_deref(),
-            );
-            insert_default_string_field(
-                reasoning,
-                "summary",
-                request_defaults.reasoning_summary.as_deref(),
-            );
-        }
+    if has_reasoning_defaults && let Some(reasoning) = ensure_object_field(body, "reasoning") {
+        insert_default_string_field(
+            reasoning,
+            "effort",
+            request_defaults.reasoning_effort.as_deref(),
+        );
+        insert_default_string_field(
+            reasoning,
+            "summary",
+            request_defaults.reasoning_summary.as_deref(),
+        );
     }
 
     let has_text_defaults = request_defaults
@@ -454,14 +450,12 @@ fn apply_request_defaults(
         .as_deref()
         .is_some_and(|value| !value.trim().is_empty());
 
-    if has_text_defaults {
-        if let Some(text) = ensure_object_field(body, "text") {
-            insert_default_string_field(
-                text,
-                "verbosity",
-                request_defaults.text_verbosity.as_deref(),
-            );
-        }
+    if has_text_defaults && let Some(text) = ensure_object_field(body, "text") {
+        insert_default_string_field(
+            text,
+            "verbosity",
+            request_defaults.text_verbosity.as_deref(),
+        );
     }
 
     normalize_include(body, &request_defaults.include)
@@ -703,7 +697,7 @@ async fn handle_success_response(
             tracing::warn!(
                 %request_id,
                 upstream_request_id = upstream_request_id.as_deref().unwrap_or("missing"),
-                body_snippet = %sanitize_body_snippet(text.as_bytes()),
+                body_summary = %redact_sensitive_text(&text),
                 "successful upstream response did not contain a parseable final JSON payload; returning raw text envelope"
             );
             Value::String(text)
@@ -763,7 +757,7 @@ pub async fn map_upstream_error(upstream: UpstreamExchange) -> Response {
         upstream_request_id = upstream_request_id.as_deref().unwrap_or("missing"),
         status = %original_status,
         mapped_status = %status,
-        body_snippet = %sanitize_body_snippet(&body),
+        body_summary = %summarize_error_body(&body),
         "upstream returned error response"
     );
 
@@ -816,10 +810,10 @@ fn attach_diagnostic_headers(
         headers.insert(PROXY_REQUEST_ID_HEADER, value);
     }
 
-    if let Some(upstream_request_id) = upstream_request_id {
-        if let Ok(value) = HeaderValue::from_str(upstream_request_id) {
-            headers.insert(PROXY_UPSTREAM_REQUEST_ID_HEADER, value);
-        }
+    if let Some(upstream_request_id) = upstream_request_id
+        && let Ok(value) = HeaderValue::from_str(upstream_request_id)
+    {
+        headers.insert(PROXY_UPSTREAM_REQUEST_ID_HEADER, value);
     }
 }
 
@@ -830,15 +824,79 @@ fn upstream_request_id_from_headers(headers: &reqwest::header::HeaderMap) -> Opt
         .map(ToOwned::to_owned)
 }
 
-fn sanitize_body_snippet(body: &[u8]) -> String {
+fn summarize_error_body(body: &[u8]) -> String {
     let text = String::from_utf8_lossy(body);
     let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if compact.chars().count() <= MAX_ERROR_BODY_SNIPPET_CHARS {
-        compact
+
+    if let Ok(value) = serde_json::from_str::<Value>(&compact) {
+        let error = value.get("error").unwrap_or(&value);
+        let error_type = error
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let error_code = error
+            .get("code")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let error_param = error
+            .get("param")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let message = error
+            .get("message")
+            .and_then(Value::as_str)
+            .map(redact_sensitive_text)
+            .unwrap_or_else(|| "missing".to_owned());
+        return format!(
+            "json_error[type={error_type}, code={error_code}, param={error_param}, message={message}]"
+        );
+    }
+
+    redact_sensitive_text(&compact)
+}
+
+fn redact_sensitive_text(text: &str) -> String {
+    let mut redacted = text.to_owned();
+    for marker in ["Bearer ", "bearer ", "sk-", "eyJ"] {
+        redacted = redact_after_marker(&redacted, marker);
+    }
+
+    if redacted.chars().count() <= MAX_ERROR_BODY_SNIPPET_CHARS {
+        redacted
     } else {
-        let truncated = compact.chars().take(MAX_ERROR_BODY_SNIPPET_CHARS).collect::<String>();
+        let truncated = redacted
+            .chars()
+            .take(MAX_ERROR_BODY_SNIPPET_CHARS)
+            .collect::<String>();
         format!("{truncated}...[truncated]")
     }
+}
+
+fn redact_after_marker(text: &str, marker: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut remaining = text;
+
+    while let Some(index) = remaining.find(marker) {
+        let (before, after_marker) = remaining.split_at(index);
+        output.push_str(before);
+        output.push_str(marker);
+
+        let secret = after_marker[marker.len()..]
+            .chars()
+            .take_while(|c| !c.is_whitespace() && *c != '"' && *c != '\'' && *c != ',' && *c != '}')
+            .collect::<String>();
+
+        if secret.is_empty() {
+            remaining = &after_marker[marker.len()..];
+            continue;
+        }
+
+        output.push_str("[redacted]");
+        remaining = &after_marker[marker.len() + secret.len()..];
+    }
+
+    output.push_str(remaining);
+    output
 }
 
 /// Scan an SSE text body for the final response object.
