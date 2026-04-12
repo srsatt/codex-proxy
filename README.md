@@ -318,6 +318,30 @@ curl http://127.0.0.1:8317/v1/responses \
   }'
 ```
 
+### Example — Droid
+
+Add a custom model entry to `~/.factory/settings.json`:
+
+```json
+{
+  "customModels": [
+    {
+      "model": "gpt-5.4",
+      "id": "custom:GPT-5.4",
+      "index": 1,
+      "baseUrl": "http://127.0.0.1:8317/v1",
+      "apiKey": "sk-codex-proxy-<your-key>",
+      "displayName": "GPT-5.4",
+      "maxOutputTokens": 128000,
+      "noImageSupport": false,
+      "provider": "openai"
+    }
+  ]
+}
+```
+
+Replace `sk-codex-proxy-<your-key>` with the key printed by `codex-proxy auth`. The model will appear as **GPT-5.4** in Droid's model picker.
+
 ---
 
 ## CLI reference
