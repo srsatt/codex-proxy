@@ -119,12 +119,12 @@ Because the OAuth callback listener runs inside the container, you need to
 authenticate via `docker exec` and handle the browser step manually:
 
 ```bash
-docker exec -it codex-proxy-codex-proxy-1 \
+docker exec -it codex-proxy \
   codex-proxy auth --no-browser
 ```
 
-> **Note**: the container name is `codex-proxy-codex-proxy-1` with the default
-> Compose project name. Run `docker ps` to confirm the exact name.
+> **Note**: the bundled Compose file sets `container_name: codex-proxy`. If
+> your local setup differs, run `docker ps` to confirm the exact name.
 
 If you prefer Compose-aware exec, use:
 
