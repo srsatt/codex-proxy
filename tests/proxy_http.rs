@@ -4,7 +4,7 @@ use axum::{
     Router,
     body::{Body, Bytes, to_bytes},
     extract::State,
-    http::{HeaderMap, Request, StatusCode, header, request::Builder},
+    http::{HeaderMap, Request, StatusCode, header},
     response::{IntoResponse, Response},
     routing::post,
 };
@@ -30,6 +30,8 @@ struct MockUpstreamState {
     responses_body: String,
     token_response: Option<Value>,
 }
+
+const MOCK_UPSTREAM_REQUEST_ID: &str = "upstream-test-request-id";
 
 #[derive(Debug, Clone)]
 struct RecordedRequest {
@@ -123,6 +125,7 @@ async fn mock_responses_handler(
     Response::builder()
         .status(state.responses_status)
         .header(header::CONTENT_TYPE, state.responses_content_type.as_str())
+        .header("x-request-id", MOCK_UPSTREAM_REQUEST_ID)
         .body(Body::from(state.responses_body.clone()))
         .expect("responses response")
 }
@@ -215,8 +218,29 @@ async fn read_text(response: Response) -> String {
     String::from_utf8(bytes.to_vec()).expect("utf8 response")
 }
 
-fn auth_request(builder: Builder, fake_api_key: &str) -> Builder {
-    builder.header(header::AUTHORIZATION, format!("Bearer {fake_api_key}"))
+fn get_request(uri: &str) -> Request<Body> {
+    Request::builder()
+        .uri(uri)
+        .body(Body::empty())
+        .expect("request")
+}
+
+fn auth_get_request(uri: &str, fake_api_key: &str) -> Request<Body> {
+    Request::builder()
+        .uri(uri)
+        .header(header::AUTHORIZATION, format!("Bearer {fake_api_key}"))
+        .body(Body::empty())
+        .expect("request")
+}
+
+fn auth_json_request(uri: &str, fake_api_key: &str, body: &Value) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header(header::AUTHORIZATION, format!("Bearer {fake_api_key}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_vec(body).expect("request body")))
+        .expect("request")
 }
 
 #[tokio::test]
@@ -237,23 +261,14 @@ async fn models_routes_require_fake_api_key_and_return_expected_payloads() {
 
     let unauthorized = app
         .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/v1/models")
-                .body(Body::empty())
-                .expect("request"),
-        )
+        .oneshot(get_request("/v1/models"))
         .await
         .expect("response");
     assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
 
     let models = app
         .clone()
-        .oneshot(
-            auth_request(Request::builder().uri("/v1/models"), "sk-codex-proxy-test")
-                .body(Body::empty())
-                .expect("request"),
-        )
+        .oneshot(auth_get_request("/v1/models", "sk-codex-proxy-test"))
         .await
         .expect("response");
     assert_eq!(models.status(), StatusCode::OK);
@@ -262,14 +277,10 @@ async fn models_routes_require_fake_api_key_and_return_expected_payloads() {
     assert_eq!(payload["data"][0]["id"], "gpt-5.4");
 
     let missing_model = app
-        .oneshot(
-            auth_request(
-                Request::builder().uri("/v1/models/not-a-real-model"),
-                "sk-codex-proxy-test",
-            )
-            .body(Body::empty())
-            .expect("request"),
-        )
+        .oneshot(auth_get_request(
+            "/v1/models/not-a-real-model",
+            "sk-codex-proxy-test",
+        ))
         .await
         .expect("response");
     assert_eq!(missing_model.status(), StatusCode::NOT_FOUND);
@@ -335,21 +346,23 @@ async fn responses_route_forwards_normalized_request_and_collapses_sse() {
     });
 
     let response = app
-        .oneshot(
-            auth_request(
-                Request::builder().method("POST").uri("/v1/responses"),
-                "sk-codex-proxy-test",
-            )
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(
-                serde_json::to_vec(&request_body).expect("request body"),
-            ))
-            .expect("request"),
-        )
+        .oneshot(auth_json_request(
+            "/v1/responses",
+            "sk-codex-proxy-test",
+            &request_body,
+        ))
         .await
         .expect("response");
 
     assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.headers().contains_key("x-codex-proxy-request-id"));
+    assert_eq!(
+        response
+            .headers()
+            .get("x-codex-proxy-upstream-request-id")
+            .and_then(|value| value.to_str().ok()),
+        Some(MOCK_UPSTREAM_REQUEST_ID)
+    );
     let payload = read_json(response).await;
     assert_eq!(payload["id"], "resp_123");
 
@@ -390,6 +403,7 @@ async fn responses_route_forwards_normalized_request_and_collapses_sse() {
     assert_eq!(forwarded.header("originator"), Some("codex_cli_rs"));
     assert_eq!(forwarded.header("conversation_id"), Some("session-123"));
     assert_eq!(forwarded.header("session_id"), Some("session-123"));
+    assert!(forwarded.header("x-client-request-id").is_some());
 }
 
 #[tokio::test]
@@ -424,25 +438,26 @@ async fn responses_route_refreshes_expired_tokens_before_forwarding() {
     );
 
     let response = app
-        .oneshot(
-            auth_request(
-                Request::builder().method("POST").uri("/v1/responses"),
-                "sk-codex-proxy-test",
-            )
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(
-                serde_json::to_vec(&json!({
-                    "model": "gpt-5.4",
-                    "input": [{ "type": "message", "role": "user", "content": "hello" }]
-                }))
-                .expect("request body"),
-            ))
-            .expect("request"),
-        )
+        .oneshot(auth_json_request(
+            "/v1/responses",
+            "sk-codex-proxy-test",
+            &json!({
+                "model": "gpt-5.4",
+                "input": [{ "type": "message", "role": "user", "content": "hello" }]
+            }),
+        ))
         .await
         .expect("response");
 
     assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.headers().contains_key("x-codex-proxy-request-id"));
+    assert_eq!(
+        response
+            .headers()
+            .get("x-codex-proxy-upstream-request-id")
+            .and_then(|value| value.to_str().ok()),
+        Some(MOCK_UPSTREAM_REQUEST_ID)
+    );
     assert_eq!(upstream.token_requests.lock().await.len(), 1);
 
     let recorded = upstream.responses_requests.lock().await;
@@ -455,6 +470,7 @@ async fn responses_route_refreshes_expired_tokens_before_forwarding() {
         recorded[0].header("chatgpt-account-id"),
         Some("account-new")
     );
+    assert!(recorded[0].header("x-client-request-id").is_some());
 
     let stored = load_tokens(&paths)
         .expect("load tokens")
@@ -488,25 +504,26 @@ async fn responses_route_maps_usage_limit_404_to_429() {
     );
 
     let response = app
-        .oneshot(
-            auth_request(
-                Request::builder().method("POST").uri("/v1/responses"),
-                "sk-codex-proxy-test",
-            )
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(
-                serde_json::to_vec(&json!({
-                    "model": "gpt-5.4",
-                    "input": [{ "type": "message", "role": "user", "content": "hello" }]
-                }))
-                .expect("request body"),
-            ))
-            .expect("request"),
-        )
+        .oneshot(auth_json_request(
+            "/v1/responses",
+            "sk-codex-proxy-test",
+            &json!({
+                "model": "gpt-5.4",
+                "input": [{ "type": "message", "role": "user", "content": "hello" }]
+            }),
+        ))
         .await
         .expect("response");
 
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(response.headers().contains_key("x-codex-proxy-request-id"));
+    assert_eq!(
+        response
+            .headers()
+            .get("x-codex-proxy-upstream-request-id")
+            .and_then(|value| value.to_str().ok()),
+        Some(MOCK_UPSTREAM_REQUEST_ID)
+    );
     assert_eq!(read_text(response).await, "usage_limit_reached");
 }
 
@@ -535,30 +552,29 @@ async fn chat_completions_route_converts_upstream_sse_to_chat_completion_json() 
     );
 
     let response = app
-        .oneshot(
-            auth_request(
-                Request::builder()
-                    .method("POST")
-                    .uri("/v1/chat/completions"),
-                "sk-codex-proxy-test",
-            )
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(
-                serde_json::to_vec(&json!({
-                    "model": "openai/gpt-5-codex",
-                    "messages": [
-                        { "role": "user", "content": "hello" }
-                    ],
-                    "max_tokens": 64
-                }))
-                .expect("request body"),
-            ))
-            .expect("request"),
-        )
+        .oneshot(auth_json_request(
+            "/v1/chat/completions",
+            "sk-codex-proxy-test",
+            &json!({
+                "model": "openai/gpt-5-codex",
+                "messages": [
+                    { "role": "user", "content": "hello" }
+                ],
+                "max_tokens": 64
+            }),
+        ))
         .await
         .expect("response");
 
     assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.headers().contains_key("x-codex-proxy-request-id"));
+    assert_eq!(
+        response
+            .headers()
+            .get("x-codex-proxy-upstream-request-id")
+            .and_then(|value| value.to_str().ok()),
+        Some(MOCK_UPSTREAM_REQUEST_ID)
+    );
     let payload = read_json(response).await;
     assert_eq!(payload["object"], "chat.completion");
     assert_eq!(payload["choices"][0]["message"]["content"], "Finished.");
@@ -570,6 +586,7 @@ async fn chat_completions_route_converts_upstream_sse_to_chat_completion_json() 
     assert_eq!(recorded[0].body["stream"], true);
     assert_eq!(recorded[0].body["max_output_tokens"], 64);
     assert_eq!(recorded[0].body["input"][0]["role"], "user");
+    assert!(recorded[0].header("x-client-request-id").is_some());
 }
 
 #[tokio::test]
@@ -580,30 +597,22 @@ async fn chat_completions_route_rejects_streaming_requests() {
     let app = make_proxy_app(Config::default(), paths, "sk-codex-proxy-test", None);
 
     let response = app
-        .oneshot(
-            auth_request(
-                Request::builder()
-                    .method("POST")
-                    .uri("/v1/chat/completions"),
-                "sk-codex-proxy-test",
-            )
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(
-                serde_json::to_vec(&json!({
-                    "model": "gpt-5.4",
-                    "stream": true,
-                    "messages": [
-                        { "role": "user", "content": "hello" }
-                    ]
-                }))
-                .expect("request body"),
-            ))
-            .expect("request"),
-        )
+        .oneshot(auth_json_request(
+            "/v1/chat/completions",
+            "sk-codex-proxy-test",
+            &json!({
+                "model": "gpt-5.4",
+                "stream": true,
+                "messages": [
+                    { "role": "user", "content": "hello" }
+                ]
+            }),
+        ))
         .await
         .expect("response");
 
     assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    assert!(response.headers().contains_key("x-codex-proxy-request-id"));
     let payload = read_json(response).await;
     assert_eq!(payload["error"]["type"], "proxy_error");
 }

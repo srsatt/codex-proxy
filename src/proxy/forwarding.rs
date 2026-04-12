@@ -733,7 +733,8 @@ async fn handle_success_response(
 pub async fn map_upstream_error(upstream: UpstreamExchange) -> Response {
     let request_id = upstream.request_id;
     let response = upstream.response;
-    let mut status = response.status();
+    let original_status = response.status();
+    let mut status = original_status;
     let upstream_request_id = upstream_request_id_from_headers(response.headers());
     let headers = response_headers(response.headers());
     let body = response.bytes().await.unwrap_or_default();
@@ -760,7 +761,7 @@ pub async fn map_upstream_error(upstream: UpstreamExchange) -> Response {
     tracing::warn!(
         %request_id,
         upstream_request_id = upstream_request_id.as_deref().unwrap_or("missing"),
-        status = %response.status(),
+        status = %original_status,
         mapped_status = %status,
         body_snippet = %sanitize_body_snippet(&body),
         "upstream returned error response"
@@ -1021,8 +1022,14 @@ mod tests {
             "prompt_cache_key": "session-123"
         });
 
-        let headers = build_upstream_headers(&request_headers, &tokens, &config, &request_body)
-            .expect("headers");
+        let headers = build_upstream_headers(
+            &request_headers,
+            &tokens,
+            &config,
+            &request_body,
+            "proxy-request-123",
+        )
+        .expect("headers");
 
         assert_eq!(
             headers
@@ -1047,6 +1054,12 @@ mod tests {
         assert_eq!(
             headers.get("session_id").and_then(|v| v.to_str().ok()),
             Some("session-123")
+        );
+        assert_eq!(
+            headers
+                .get("x-client-request-id")
+                .and_then(|v| v.to_str().ok()),
+            Some("proxy-request-123")
         );
     }
 

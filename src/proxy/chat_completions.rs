@@ -19,9 +19,9 @@ use serde_json::{Map, Value, json};
 use crate::config::{ModelsConfig, RequestDefaultsConfig};
 
 use super::forwarding::{
-    ForwardingState, PreparedRequest, UpstreamExchange, error_response,
-    error_response_with_request_id, extract_success_response_json, map_upstream_error,
-    prepare_request_body, send_prepared_request,
+    ForwardingState, PreparedRequest, UpstreamExchange, error_response_with_request_id,
+    extract_success_response_json, map_upstream_error, prepare_request_body,
+    send_prepared_request,
 };
 
 /// Handler for `POST /v1/chat/completions`.
