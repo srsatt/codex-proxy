@@ -1,93 +1,175 @@
-# codex-proxy Agent Guide
+# codex-proxy — Agent Guide
 
-## Mission
+## Purpose
 
-`codex-proxy` authenticates to ChatGPT via OAuth and exposes a local OpenAI-compatible endpoint for coding tools such as Droid.
+`codex-proxy` is a Rust daemon and CLI that authenticates a single user with
+ChatGPT OAuth, generates a local fake API key, and exposes an OpenAI-compatible
+HTTP endpoint. Coding tools point at this proxy instead of the real OpenAI
+platform and get requests transparently forwarded to the ChatGPT Codex backend.
 
-The intended product shape is:
+The intended product shape:
 
-- authenticate a single user with ChatGPT OAuth
-- generate a local fake API key with `openssl`
-- expose a local endpoint that tools can treat like a Codex/OpenAI-compatible base URL
-- forward those requests through the proxy to OpenAI using the OAuth-backed ChatGPT flow
+1. User runs `codex-proxy auth` once — OAuth PKCE flow, tokens persisted.
+2. User runs `codex-proxy start` — proxy daemon listens on `127.0.0.1:8317`.
+3. Coding tool configured with `base_url=http://127.0.0.1:8317` and the fake
+   API key printed by `codex-proxy auth`.
 
-The TypeScript reference implementation lives in `examples/opencode-openai-codex-auth-main`. This repository is the Rust rewrite.
+---
+
+## Repository Layout
+
+```
+src/
+  main.rs                  — binary entry point
+  lib.rs                   — crate root, module exports
+  app.rs                   — run(), CLI dispatch, tracing init
+  cli.rs                   — Clap CLI definitions (Cli, StartArgs, AuthArgs)
+  config.rs                — Config struct and all sub-sections (TOML)
+  state.rs                 — ProxyState, TokenStore, fake-key generation
+  storage.rs               — read_json / write_json / write_string helpers
+  paths.rs                 — AppPaths: centralised file path management
+  constants.rs             — CALLBACK_PATH, FAKE_API_KEY_PREFIX, TOKEN_REFRESH_WINDOW_SECONDS
+  time.rs                  — unix_timestamp_secs()
+  browser.rs               — open_browser_url() wrapper
+  commands/
+    mod.rs
+    start.rs               — `codex-proxy start` handler
+    auth.rs                — `codex-proxy auth` handler (full OAuth flow)
+  auth/
+    mod.rs                 — PKCE generation, token exchange, refresh, JWT decode
+    callback.rs            — temporary Axum server for OAuth callback
+  proxy/
+    mod.rs                 — Axum router, ProxyAppState, route handlers, auth gate
+    forwarding.rs          — request normalization, upstream forwarding, SSE handling
+    chat_completions.rs    — POST /v1/chat/completions compatibility adapter
+
+tests/
+  fixtures/
+    responses_request_input.json    — example un-normalized /v1/responses body
+    responses_request_expected.json — expected body after normalization
+
+Cargo.toml
+config.example.toml        — reference config mirroring compiled-in defaults
+Dockerfile                 — multi-stage build (builder + minimal runtime)
+docker-compose.yml         — compose example with named volume for /app/data
+scripts/
+  release-check.sh         — automated release validation helper
+```
+
+---
 
 ## Runtime Contract
 
-Preserve these runtime files unless the user explicitly approves a migration:
+These files are written and read across daemon restarts. **Do not change their
+paths or schema without a deliberate migration.**
 
-- `config.toml`
-- `data/state.json`
-- `data/tokens.json`
+| File | Contents |
+|------|----------|
+| `./config.toml` | Runtime configuration (TOML). Auto-created on first start. |
+| `./data/state.json` | Fake API key + pending OAuth flow state. |
+| `./data/tokens.json` | OAuth access token, refresh token, expiry. |
 
-Inside Docker, the app runs with `WORKDIR /app`, so the container contract becomes:
+Inside Docker (`WORKDIR /app`) the same relative paths resolve to
+`/app/config.toml`, `/app/data/state.json`, `/app/data/tokens.json`.
 
-- `/app/config.toml`
-- `/app/data/state.json`
-- `/app/data/tokens.json`
+---
 
-`config.toml` is the runtime source of truth. If it is missing, the daemon creates it on first start. Keep [`config.example.toml`](./config.example.toml) aligned with the generated schema and defaults.
+## Key Concepts
 
-## Current Skeleton
+### Fake API Key
+Generated once via `openssl rand -hex 24`, prefixed `sk-codex-proxy-`, stored
+in `state.json`. Clients send this key as `Authorization: Bearer <key>` or
+`x-api-key: <key>`. The proxy validates it before forwarding any request.
 
-The current repository baseline already includes:
+### Token Lifecycle
+Tokens are classified as `Missing | Valid | Expiring | Expired` using
+`TOKEN_REFRESH_WINDOW_SECONDS = 300`. On daemon startup and on every forwarding
+request the proxy checks this status and attempts a refresh when the token is
+expiring or expired. Refreshed tokens are persisted to `tokens.json` and
+updated in the in-memory `Arc<RwLock<Option<TokenStore>>>`.
 
-- `codex-proxy start`
-- `codex-proxy auth`
-- PKCE generation and local OAuth callback capture
-- OAuth token exchange and persistence
-- stored-token classification for missing, valid, expiring, and expired states
-- refresh-token reuse from both `auth` and daemon startup paths
-- forwarding for `POST /v1/responses`
-- stateless request normalization for `store: false`, removed `item_reference`, and stripped item IDs
-- SSE passthrough for streaming requests and SSE-to-JSON conversion for non-streaming requests
-- non-streaming compatibility for `POST /v1/chat/completions`
-- OpenAI-compatible model discovery via `GET /v1/models` and `GET /v1/models/{model_id}`
-- config-driven model advertisement and alias normalization via `[models]` and `[models.aliases]` in `config.toml`
-- readiness output at `GET /readyz` plus richer `GET /healthz` state
-- structured logs around forwarding, upstream responses, and request-transformation decisions
-- fake API key generation through `openssl`
-- a local HTTP server with `GET /healthz` and `GET /v1/models`
-- multi-stage container packaging with a bundled `/app/config.toml`, non-root runtime user, and a compose example that persists `/app/data`
-- container defaults that bind the daemon to `0.0.0.0` while preserving the `/app` runtime contract
-- container health checks against `GET /healthz`
-- release validation via `scripts/release-check.sh`
+### Request Normalization (`prepare_request_body`)
+Every `POST /v1/responses` request is normalized before forwarding:
+- Model name canonicalized via `ModelsConfig::canonicalize` (alias map + fallback).
+- `store: false` forced (backend must not cache).
+- `stream: true` forced (proxy always streams from backend).
+- `item_reference` items removed from the `input` array.
+- `id` fields stripped from all remaining `input` items.
+- Orphaned `function_call_output` items (whose pair was removed) dropped.
+- `reasoning.encrypted_content` added to the `include` array if missing.
 
-Forwarding is currently centered on `POST /v1/responses`, with a non-streaming compatibility adapter for `POST /v1/chat/completions`. Use the phase docs in `/plans` before widening scope.
+### Chat Completions Adapter
+`POST /v1/chat/completions` is translated into the responses format by
+`translate_chat_completions_request`, forwarded via the same normalization
+pipeline, then the response is converted back by `responses_to_chat_completion`.
+Streaming is not yet supported on this route.
 
-## Reference Implementation Notes
+### SSE Handling
+The upstream always returns an SSE stream. For streaming clients the bytes are
+piped directly. For non-streaming clients `parse_sse_final_response` scans for
+a `response.done` or `response.completed` event and returns its `response`
+field as JSON.
 
-The TypeScript example is the main behavior reference. Important details to preserve when implementing forwarding:
+---
 
-- ChatGPT OAuth uses `https://auth.openai.com/oauth/authorize` and `https://auth.openai.com/oauth/token`
-- the callback path is `/auth/callback`
-- the authorize URL includes `id_token_add_organizations=true`, `codex_cli_simplified_flow=true`, and `originator=codex_cli_rs`
-- the ChatGPT backend base URL is `https://chatgpt.com/backend-api`
-- request forwarding should target the Codex responses path, not the ordinary platform path
-- future request transformation must account for `store: false`, stripped item IDs, and filtered `item_reference` entries just like the TypeScript reference
+## HTTP API
 
-## Working Rules For Future Agents
+| Method | Path | Auth required | Notes |
+|--------|------|---------------|-------|
+| GET | `/healthz` | No | Rich JSON status (token_status, forwarding_ready, …) |
+| GET | `/readyz` | No | 200 = forwarding ready, 503 = not ready |
+| GET | `/v1/models` | Yes | Lists `config.models.advertised` |
+| GET | `/v1/models/{model_id}` | Yes | 404 if model not in advertised list |
+| POST | `/v1/responses` | Yes | Primary forwarding route |
+| POST | `/v1/chat/completions` | Yes | Non-streaming compat adapter |
+
+---
+
+## Configuration Reference
+
+All sections have sensible defaults and auto-serialize to `config.toml` on
+first run. See `config.example.toml` for an annotated reference.
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `server.bind` | `127.0.0.1` | Proxy listen host |
+| `server.port` | `8317` | Proxy listen port |
+| `server.log_filter` | `info` | tracing filter (same as RUST_LOG) |
+| `auth.callback_host` | `127.0.0.1` | OAuth callback listener host |
+| `auth.callback_port` | `1455` | OAuth callback listener port |
+| `auth.open_browser` | `true` | Auto-open browser during auth |
+| `auth.timeout_seconds` | `300` | Seconds to wait for OAuth callback |
+| `upstream.responses_base_url` | `https://chatgpt.com/backend-api` | ChatGPT backend |
+| `upstream.codex_responses_path` | `/codex/responses` | Codex endpoint path |
+| `models.advertised` | `["gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex"]` | Models returned by /v1/models |
+| `models.fallback` | `gpt-5.4` | Model used when no alias matches |
+| `models.aliases` | see config.example.toml | Provider-prefixed → canonical name map |
+
+---
+
+## Working Rules
 
 - Keep the path contract stable unless a migration is part of the task.
-- Update `README.md`, `AGENTS.md`, `config.example.toml`, and `/plans` together when changing architecture or runtime behavior.
+- Update `README.md`, `AGENTS.md`, and `config.example.toml` together when
+  changing runtime behaviour or architecture.
 - Prefer small, testable diffs over broad rewrites.
-- Add or update validation steps whenever you add a new phase or materially change acceptance criteria.
-- Treat the example TypeScript repo as a reference, not a source to copy mechanically.
+- Add or update tests when adding normalization logic or changing the request
+  pipeline — the fixture files in `tests/fixtures/` are the canonical input/output
+  contract for `prepare_request_body`.
 
 ## Validation Baseline
 
 Before closing meaningful changes, run:
 
-- `cargo fmt`
-- `cargo check`
-- `cargo test`
+```bash
+cargo fmt
+cargo check
+cargo test
+```
 
 When Docker or packaging changes are involved, also run:
 
-- `docker build -t codex-proxy:latest .`
-- `./scripts/release-check.sh`
-
-## Phase Plans
-
-See [`plans/README.md`](./plans/README.md) for the active phase breakdown and acceptance contracts.
+```bash
+docker build -t codex-proxy:latest .
+./scripts/release-check.sh
+```
