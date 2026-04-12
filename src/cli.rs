@@ -81,6 +81,14 @@ pub struct AuthArgs {
     )]
     pub force: bool,
 
+    /// Complete a pending OAuth flow by pasting the final browser callback URL.
+    ///
+    /// Useful when the browser reaches `http://localhost:1455/auth/callback?...`
+    /// but cannot connect to the waiting local callback server, for example in
+    /// some Docker or remote-environment setups.
+    #[arg(long, value_name = "URL", help = "Complete auth using a pasted callback URL")]
+    pub callback_url: Option<String>,
+
     /// Override the host embedded in the OAuth redirect URI.
     #[arg(long, value_name = "HOST", help = "Override the OAuth redirect host")]
     pub callback_host: Option<String>,

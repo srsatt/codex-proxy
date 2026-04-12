@@ -9,6 +9,8 @@ examples/**
 
 # agents
 .agents/**
+.codex/**
+.claude/**
 
 # plans
 plans/**

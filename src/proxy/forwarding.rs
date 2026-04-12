@@ -73,7 +73,18 @@ pub struct PreparedRequest {
 /// Correlated upstream exchange for a single proxied request.
 pub struct UpstreamExchange {
     pub request_id: String,
-    pub response: reqwest::Response,
+    pub upstream_request_id: Option<String>,
+    pub status: StatusCode,
+    pub upstream_headers: reqwest::header::HeaderMap,
+    pub body: UpstreamExchangeBody,
+}
+
+/// The upstream response body — either a live stream or already-buffered bytes.
+pub enum UpstreamExchangeBody {
+    /// Body has not been read yet.
+    Live(reqwest::Response),
+    /// Body was consumed during unsupported-parameter retry detection.
+    Buffered(Bytes),
 }
 
 /// Records every transformation applied during [`prepare_request_body`].
@@ -155,7 +166,7 @@ pub async fn forward_responses(
         }
     };
 
-    if !upstream.response.status().is_success() {
+    if !upstream.status.is_success() {
         return map_upstream_error(upstream).await;
     }
 
@@ -190,29 +201,14 @@ pub async fn send_prepared_request(
     let token_status = tokens.auth_status().as_str();
 
     let upstream_url = upstream_responses_url(&state.config)?;
-    let upstream_headers = build_upstream_headers(
-        request_headers,
-        &tokens,
-        &state.config,
-        &prepared_request.body,
-        request_id,
-    )?;
     let transformation = &prepared_request.transformation;
-    let model = transformation
-        .normalized_model
-        .as_deref()
-        .unwrap_or("unknown");
-    let original_model = transformation
-        .original_model
-        .as_deref()
-        .unwrap_or("unknown");
 
     tracing::info!(
         %request_id,
         route_kind,
         token_status,
-        model,
-        original_model,
+        model = transformation.normalized_model.as_deref().unwrap_or("unknown"),
+        original_model = transformation.original_model.as_deref().unwrap_or("unknown"),
         model_changed = transformation.original_model != transformation.normalized_model,
         original_stream = prepared_request.original_stream,
         input_items_before = transformation.input_items_before,
@@ -224,47 +220,101 @@ pub async fn send_prepared_request(
         "forwarding request to upstream"
     );
 
-    let response = state
-        .client
-        .post(upstream_url)
-        .headers(upstream_headers)
-        .body(serde_json::to_vec(&prepared_request.body)?)
-        .send()
-        .await;
+    // Mutable body so we can strip unsupported parameters and retry.
+    let mut body = prepared_request.body.clone();
+    const MAX_STRIP_RETRIES: usize = 10;
 
-    let response = match response {
-        Ok(response) => response,
-        Err(error) => {
-            tracing::error!(%request_id, route_kind, error = %error, "failed to reach the ChatGPT Codex backend");
-            return Err(error).context("failed to reach the ChatGPT Codex backend");
+    for attempt in 0..=MAX_STRIP_RETRIES {
+        let upstream_headers = build_upstream_headers(
+            request_headers,
+            &tokens,
+            &state.config,
+            &body,
+            request_id,
+        )?;
+
+        let response = state
+            .client
+            .post(upstream_url.clone())
+            .headers(upstream_headers)
+            .body(serde_json::to_vec(&body)?)
+            .send()
+            .await;
+
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                tracing::error!(%request_id, route_kind, error = %error, "failed to reach the ChatGPT Codex backend");
+                return Err(error).context("failed to reach the ChatGPT Codex backend");
+            }
+        };
+
+        let status = response.status();
+        let upstream_request_id = upstream_request_id_from_headers(response.headers());
+        let upstream_headers = response.headers().clone();
+
+        // On 400, check whether the upstream is rejecting a specific field.
+        // If so, strip it and retry rather than surfacing the error to the client.
+        if status == StatusCode::BAD_REQUEST && attempt < MAX_STRIP_RETRIES {
+            let body_bytes = response.bytes().await.unwrap_or_default();
+            if let Some(param) = extract_unsupported_param(&body_bytes) {
+                tracing::warn!(
+                    %request_id,
+                    route_kind,
+                    param,
+                    attempt,
+                    "upstream rejected unsupported parameter — stripping and retrying"
+                );
+                if let Some(obj) = body.as_object_mut() {
+                    obj.remove(&param);
+                }
+                continue;
+            }
+            // 400 but not an unsupported-parameter error — body already consumed.
+            tracing::warn!(
+                %request_id,
+                route_kind,
+                status = %status,
+                upstream_request_id = upstream_request_id.as_deref().unwrap_or("missing"),
+                "upstream request completed with non-success status"
+            );
+            return Ok(UpstreamExchange {
+                request_id: request_id.to_owned(),
+                upstream_request_id,
+                status,
+                upstream_headers,
+                body: UpstreamExchangeBody::Buffered(body_bytes),
+            });
         }
-    };
 
-    let status = response.status();
-    let upstream_request_id = upstream_request_id_from_headers(response.headers());
+        if status.is_success() {
+            tracing::info!(
+                %request_id,
+                route_kind,
+                status = %status,
+                upstream_request_id = upstream_request_id.as_deref().unwrap_or("missing"),
+                "upstream request completed"
+            );
+        } else {
+            tracing::warn!(
+                %request_id,
+                route_kind,
+                status = %status,
+                upstream_request_id = upstream_request_id.as_deref().unwrap_or("missing"),
+                "upstream request completed with non-success status"
+            );
+        }
 
-    if status.is_success() {
-        tracing::info!(
-            %request_id,
-            route_kind,
-            status = %status,
-            upstream_request_id = upstream_request_id.as_deref().unwrap_or("missing"),
-            "upstream request completed"
-        );
-    } else {
-        tracing::warn!(
-            %request_id,
-            route_kind,
-            status = %status,
-            upstream_request_id = upstream_request_id.as_deref().unwrap_or("missing"),
-            "upstream request completed with non-success status"
-        );
+        return Ok(UpstreamExchange {
+            request_id: request_id.to_owned(),
+            upstream_request_id,
+            status,
+            upstream_headers,
+            body: UpstreamExchangeBody::Live(response),
+        });
     }
 
-    Ok(UpstreamExchange {
-        request_id: request_id.to_owned(),
-        response,
-    })
+    bail!("upstream rejected too many parameters; gave up after {MAX_STRIP_RETRIES} retries")
 }
 
 /// Parse and normalize a raw request body into a [`PreparedRequest`].
@@ -305,6 +355,7 @@ pub fn prepare_request_body(
 
     object.insert("store".to_owned(), Value::Bool(false));
     object.insert("stream".to_owned(), Value::Bool(true));
+    object.remove("prompt_cache_retention");
 
     let input_stats = object
         .get_mut("input")
@@ -607,7 +658,21 @@ async fn get_or_refresh_tokens(state: &ForwardingState) -> Result<TokenStore> {
 
     match status {
         StoredAuthStatus::Missing => {
-            bail!("no stored OAuth tokens are available; run `codex-proxy auth`");
+            // The server may have started before `codex-proxy auth` completed.
+            // Try loading tokens from disk before giving up.
+            let loaded = crate::state::load_tokens(&state.paths)
+                .context("failed to read tokens from disk")?;
+            match loaded {
+                None => bail!("no stored OAuth tokens are available; run `codex-proxy auth`"),
+                Some(tokens) => {
+                    tracing::info!(
+                        account_id = tokens.account_id.as_deref().unwrap_or("missing"),
+                        "loaded OAuth tokens from disk (auth completed after startup)"
+                    );
+                    *state.tokens.write().await = Some(tokens.clone());
+                    return Ok(tokens);
+                }
+            }
         }
         StoredAuthStatus::Valid => {
             return current.ok_or_else(|| anyhow!("stored OAuth tokens disappeared"));
@@ -663,8 +728,13 @@ async fn handle_success_response(
     original_stream: bool,
 ) -> Result<Response> {
     let request_id = upstream.request_id;
-    let response = upstream.response;
-    let upstream_request_id = upstream_request_id_from_headers(response.headers());
+    let upstream_request_id = upstream.upstream_request_id;
+    let response = match upstream.body {
+        UpstreamExchangeBody::Live(r) => r,
+        UpstreamExchangeBody::Buffered(_) => {
+            anyhow::bail!("unexpected buffered body on success response")
+        }
+    };
 
     if original_stream {
         let status = response.status();
@@ -726,12 +796,22 @@ async fn handle_success_response(
 /// can back off automatically.
 pub async fn map_upstream_error(upstream: UpstreamExchange) -> Response {
     let request_id = upstream.request_id;
-    let response = upstream.response;
-    let original_status = response.status();
+    let original_status = upstream.status;
     let mut status = original_status;
-    let upstream_request_id = upstream_request_id_from_headers(response.headers());
-    let headers = response_headers(response.headers());
-    let body = response.bytes().await.unwrap_or_default();
+    let upstream_request_id = upstream.upstream_request_id;
+    let headers = response_headers(&upstream.upstream_headers);
+    let body = match upstream.body {
+        UpstreamExchangeBody::Buffered(bytes) => bytes,
+        UpstreamExchangeBody::Live(response) => response.bytes().await.unwrap_or_default(),
+    };
+
+    tracing::debug!(
+        %request_id,
+        upstream_request_id = upstream_request_id.as_deref().unwrap_or("missing"),
+        status = %original_status,
+        raw_body = %String::from_utf8_lossy(&body),
+        "upstream error response raw body"
+    );
 
     let usage_limit_response = if status == StatusCode::NOT_FOUND {
         std::str::from_utf8(&body)
@@ -824,32 +904,44 @@ fn upstream_request_id_from_headers(headers: &reqwest::header::HeaderMap) -> Opt
         .map(ToOwned::to_owned)
 }
 
+/// If the upstream returned `{"detail":"Unsupported parameter: <name>"}`,
+/// return `Some(<name>)`. Returns `None` for any other error shape.
+fn extract_unsupported_param(body: &[u8]) -> Option<String> {
+    let value: Value = serde_json::from_slice(body).ok()?;
+    let detail = value.get("detail").and_then(Value::as_str)?;
+    let param = detail.strip_prefix("Unsupported parameter: ")?;
+    if param.is_empty() {
+        return None;
+    }
+    Some(param.to_owned())
+}
+
 fn summarize_error_body(body: &[u8]) -> String {
     let text = String::from_utf8_lossy(body);
     let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
 
     if let Ok(value) = serde_json::from_str::<Value>(&compact) {
         let error = value.get("error").unwrap_or(&value);
-        let error_type = error
-            .get("type")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown");
-        let error_code = error
-            .get("code")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown");
-        let error_param = error
-            .get("param")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown");
-        let message = error
-            .get("message")
-            .and_then(Value::as_str)
-            .map(redact_sensitive_text)
-            .unwrap_or_else(|| "missing".to_owned());
-        return format!(
-            "json_error[type={error_type}, code={error_code}, param={error_param}, message={message}]"
-        );
+        let error_type = error.get("type").and_then(Value::as_str);
+        let error_code = error.get("code").and_then(Value::as_str);
+        let error_param = error.get("param").and_then(Value::as_str);
+        let message = error.get("message").and_then(Value::as_str);
+
+        // If the body matches the OpenAI error shape, format it concisely.
+        if error_type.is_some() || message.is_some() {
+            let message_str = message
+                .map(redact_sensitive_text)
+                .unwrap_or_else(|| "missing".to_owned());
+            return format!(
+                "json_error[type={}, code={}, param={}, message={message_str}]",
+                error_type.unwrap_or("unknown"),
+                error_code.unwrap_or("unknown"),
+                error_param.unwrap_or("unknown"),
+            );
+        }
+
+        // Non-standard JSON error — log the raw body so the content isn't lost.
+        return redact_sensitive_text(&compact);
     }
 
     redact_sensitive_text(&compact)

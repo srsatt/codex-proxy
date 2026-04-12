@@ -79,7 +79,7 @@ pub async fn forward_chat_completions(
         }
     };
 
-    if !upstream.response.status().is_success() {
+    if !upstream.status.is_success() {
         return map_upstream_error(upstream).await;
     }
 
@@ -166,7 +166,13 @@ pub fn translate_chat_completions_request(
 async fn adapt_chat_completions_response(upstream: UpstreamExchange) -> Result<Response> {
     let request_id = upstream.request_id;
     let (status, response_json, upstream_request_id) =
-        extract_success_response_json(upstream.response).await?;
+        extract_success_response_json(match upstream.body {
+            crate::proxy::forwarding::UpstreamExchangeBody::Live(r) => r,
+            crate::proxy::forwarding::UpstreamExchangeBody::Buffered(_) => {
+                return Err(anyhow::anyhow!("unexpected buffered body on success response"));
+            }
+        })
+        .await?;
     let chat_completion = responses_to_chat_completion(&response_json)?;
 
     axum::http::Response::builder()

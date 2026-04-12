@@ -120,7 +120,7 @@ authenticate via `docker exec` and handle the browser step manually:
 
 ```bash
 docker exec -it codex-proxy \
-  codex-proxy auth --no-browser --callback-bind-host 0.0.0.0
+  codex-proxy auth --no-browser
 ```
 
 > **Note**: the bundled Compose file sets `container_name: codex-proxy`. If
@@ -130,7 +130,7 @@ If you prefer Compose-aware exec, use:
 
 ```bash
 docker compose exec codex-proxy \
-  codex-proxy auth --no-browser --callback-bind-host 0.0.0.0
+  codex-proxy auth --no-browser
 ```
 
 The command prints an authorization URL:
@@ -143,9 +143,21 @@ https://auth.openai.com/oauth/authorize?...
 
 Open that URL in a browser on your host machine. After you log in and grant
 access, ChatGPT redirects to `http://localhost:1455/auth/callback`. The
-listener inside the container must therefore bind to `0.0.0.0` so the
-published port can reach it, which is why the command above includes
-`--callback-bind-host 0.0.0.0`.
+container image now ships with a Docker-specific config that binds the
+temporary callback listener to `0.0.0.0`, so the published callback port can
+reach it without extra flags.
+
+If the browser reaches that `localhost` callback URL but the page itself still
+fails to load, `codex-proxy auth` now supports a paste fallback:
+
+- If the auth command is still waiting in the terminal, paste the full callback
+  URL from the browser address bar into that same terminal and press Enter.
+- Or, from a second terminal, run:
+
+```bash
+docker compose exec codex-proxy \
+  codex-proxy auth --callback-url 'http://localhost:1455/auth/callback?...'
+```
 
 The callback port must also be published. Add or confirm this in your
 `docker-compose.yml`:
@@ -190,8 +202,17 @@ docker compose down -v
 
 ### Overriding the bundled config
 
-The container image ships with a bundled `/app/config.toml`. Mount your own
-to override it:
+The container image ships with a bundled `/app/config.toml` generated from
+`config.docker.toml`. That Docker-specific config keeps:
+
+- `server.bind = "0.0.0.0"`
+- `auth.callback_bind_host = "0.0.0.0"`
+- `auth.redirect_host = "localhost"`
+
+If you mount your own config into the container, keep those Docker auth
+settings or the browser callback can fail to reach the temporary listener.
+
+Mount your own file like this:
 
 ```yaml
 services:
@@ -216,8 +237,10 @@ volumes:
 3. Starts a local HTTP server on `callback_bind_host:callback_port`
    (`127.0.0.1:1455` by default) and registers the OAuth redirect URI
    `http://localhost:1455/auth/callback` by default.
-4. Exchanges the authorization code for access + refresh tokens.
-5. Saves tokens to `data/tokens.json` and prints the fake API key.
+4. Accepts either the direct callback or a pasted callback URL fallback when
+   the browser cannot load the `localhost` callback page.
+5. Exchanges the authorization code for access + refresh tokens.
+6. Saves tokens to `data/tokens.json` and prints the fake API key.
 
 ### Token reuse and refresh
 
@@ -240,8 +263,12 @@ Configure your tool with:
 
 | Setting | Value |
 |---------|-------|
-| Base URL | `http://127.0.0.1:8317` |
+| Base URL | `http://127.0.0.1:8317/v1` |
 | API key | The `sk-codex-proxy-<hex>` key printed by `auth` |
+
+> **Note**: always include the `/v1` suffix in the base URL. Tools that speak
+> the OpenAI API append paths like `/chat/completions` or `/responses` directly
+> to the base URL, so omitting `/v1` results in 404s.
 
 ### Example — OpenAI Python SDK
 
@@ -300,6 +327,7 @@ Commands:
 ```
 --no-browser          Print the authorization URL instead of opening a browser
 --force               Start a new login even when stored tokens are valid
+--callback-url <URL>  Complete auth using a pasted callback URL
 --callback-host <HOST>  Override the OAuth redirect host
 --callback-bind-host <HOST>  Override the OAuth callback bind host
 --callback-port <PORT>  Override the OAuth callback port
@@ -310,8 +338,9 @@ Commands:
 ## Configuration
 
 If `config.toml` does not exist, the daemon creates it with defaults on first
-start. See [`config.example.toml`](./config.example.toml) for a fully
-annotated reference.
+start. See [`config.example.toml`](./config.example.toml) for local/runtime
+defaults and [`config.docker.toml`](./config.docker.toml) for the container
+defaults baked into the Docker image.
 
 ### Key settings
 
@@ -348,9 +377,21 @@ fallback = "gpt-5.4"
 RUST_LOG=debug codex-proxy start
 ```
 
-**Docker auth**: when running `codex-proxy auth` inside a container, keep
-`redirect_host = "localhost"` and use `--callback-bind-host 0.0.0.0` so the
-published callback port can reach the temporary listener.
+**Docker auth**: the container image uses a Docker-specific `/app/config.toml`
+that keeps `redirect_host = "localhost"` and sets
+`callback_bind_host = "0.0.0.0"`. That is why the plain command works:
+
+```bash
+docker compose exec codex-proxy codex-proxy auth --no-browser
+```
+
+If your browser still cannot load the `localhost:1455` callback page in that
+setup, paste the final callback URL into the same waiting terminal or run:
+
+```bash
+docker compose exec codex-proxy \
+  codex-proxy auth --callback-url 'http://localhost:1455/auth/callback?...'
+```
 
 ---
 

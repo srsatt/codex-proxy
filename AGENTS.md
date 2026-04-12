@@ -50,6 +50,7 @@ tests/
 
 Cargo.toml
 config.example.toml        — reference config mirroring compiled-in defaults
+config.docker.toml         — Docker-specific runtime config baked into the image
 Dockerfile                 — multi-stage build (builder + minimal runtime)
 docker-compose.yml         — compose example with named volume for /app/data
 scripts/
@@ -135,7 +136,8 @@ first run. See `config.example.toml` for an annotated reference.
 | `server.bind` | `127.0.0.1` | Proxy listen host |
 | `server.port` | `8317` | Proxy listen port |
 | `server.log_filter` | `info` | tracing filter (same as RUST_LOG) |
-| `auth.callback_host` | `127.0.0.1` | OAuth callback listener host |
+| `auth.callback_bind_host` | `127.0.0.1` | OAuth callback listener bind host for local runs |
+| `auth.redirect_host` | `localhost` | Host embedded in the OAuth redirect URI |
 | `auth.callback_port` | `1455` | OAuth callback listener port |
 | `auth.open_browser` | `true` | Auto-open browser during auth |
 | `auth.timeout_seconds` | `300` | Seconds to wait for OAuth callback |
@@ -172,4 +174,10 @@ When Docker or packaging changes are involved, also run:
 ```bash
 docker build -t codex-proxy:latest .
 ./scripts/release-check.sh
+```
+
+For Docker auth changes, verify the image-level config too:
+
+```bash
+docker run --rm --entrypoint cat codex-proxy:latest /app/config.toml
 ```

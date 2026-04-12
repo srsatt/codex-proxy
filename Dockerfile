@@ -17,7 +17,7 @@ RUN apt-get update \
 WORKDIR /app
 
 COPY --from=builder /src/target/release/codex-proxy /usr/local/bin/codex-proxy
-COPY --chown=codex-proxy:codex-proxy config.example.toml /app/config.toml
+COPY --chown=codex-proxy:codex-proxy config.docker.toml /app/config.toml
 
 RUN mkdir -p /app/data \
     && chown -R codex-proxy:codex-proxy /app

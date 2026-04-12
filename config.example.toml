@@ -11,9 +11,10 @@ open_browser = true
 timeout_seconds = 300
 
 # Docker auth note:
-# - keep redirect_host = "localhost"
-# - run `codex-proxy auth --no-browser --callback-bind-host 0.0.0.0`
-#   so the published callback port can reach the temporary listener
+# - the container image uses config.docker.toml instead of this file
+# - if you mount a custom config into Docker, set:
+#     callback_bind_host = "0.0.0.0"
+#     redirect_host = "localhost"
 
 [upstream]
 responses_base_url = "https://chatgpt.com/backend-api"
