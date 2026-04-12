@@ -11,7 +11,7 @@ The intended product shape:
 
 1. User runs `codex-proxy auth` once — OAuth PKCE flow, tokens persisted.
 2. User runs `codex-proxy start` — proxy daemon listens on `127.0.0.1:8317`.
-3. Coding tool configured with `base_url=http://127.0.0.1:8317` and the fake
+3. Coding tool configured with `base_url=http://127.0.0.1:8317` and the proxy
    API key printed by `codex-proxy auth`.
 
 ---

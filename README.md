@@ -6,7 +6,7 @@ speaks the OpenAI API at `http://127.0.0.1:8317` and it will be transparently
 proxied to the ChatGPT Codex backend - no real OpenAI API key required.
 
 ```
- Coding tool - (fake key) -> codex-proxy -> (OAuth token) -> ChatGPT Codex
+ Coding tool -> (proxy API key) -> codex-proxy -> (OAuth token) -> ChatGPT Codex
 ```
 
 ---
@@ -31,7 +31,7 @@ proxied to the ChatGPT Codex backend - no real OpenAI API key required.
 
 **Local binary**
 - Rust 1.94+ (`rustup` recommended)
-- `openssl` on `PATH` (used to generate the fake API key)
+- `openssl` on `PATH` (used to generate the proxy API key)
 
 **Docker**
 - Docker Engine 24+ or Docker Desktop
@@ -70,11 +70,11 @@ ChatGPT and grant access. Tokens are saved to `./data/tokens.json`.
 cargo run --release -- auth
 ```
 
-After successful login the command prints your **fake API key**:
+After successful login the command prints your **proxy API key**:
 
 ```
 Authentication complete.
-Use this fake API key with local clients:
+Use this proxy API key with local clients:
 
 sk-codex-proxy-<hex>
 ```
@@ -172,11 +172,11 @@ services:
 
 Then re-run `docker compose up --build -d` before running `auth`.
 
-After the browser redirect completes the command prints the fake API key:
+After the browser redirect completes the command prints the proxy API key:
 
 ```
 Authentication complete.
-Use this fake API key with local clients:
+Use this proxy API key with local clients:
 
 sk-codex-proxy-<hex>
 ```
@@ -259,7 +259,7 @@ volumes:
 4. Accepts either the direct callback or a pasted callback URL fallback when
    the browser cannot load the `localhost` callback page.
 5. Exchanges the authorization code for access + refresh tokens.
-6. Saves tokens to `data/tokens.json` and prints the fake API key.
+6. Saves tokens to `data/tokens.json` and prints the proxy API key.
 
 ### Token reuse and refresh
 
@@ -416,7 +416,7 @@ docker compose exec codex-proxy \
 
 ## HTTP API
 
-All endpoints except `/healthz` and `/readyz` require the fake API key:
+All endpoints except `/healthz` and `/readyz` require the proxy API key:
 
 ```
 Authorization: Bearer sk-codex-proxy-<hex>
@@ -455,7 +455,7 @@ x-api-key: sk-codex-proxy-<hex>
 
 ```
 ./config.toml          — TOML configuration (auto-created on first run)
-./data/state.json      — fake API key and pending OAuth state
+./data/state.json      — proxy API key and pending OAuth state
 ./data/tokens.json     — OAuth access and refresh tokens
 ```
 
