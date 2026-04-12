@@ -200,6 +200,25 @@ everything (including tokens):
 docker compose down -v
 ```
 
+### Troubleshooting — port not reachable on macOS
+
+If the container shows as healthy but `curl http://127.0.0.1:8317/healthz`
+returns "Connection refused", Docker Desktop's userland proxy has silently
+failed to bind the port. This is a known Docker Desktop bug on macOS — the
+port appears mapped in `docker compose ps` but nothing is actually listening
+on the host.
+
+**Fix**: use [Colima](https://github.com/abiosoft/colima) instead of Docker
+Desktop:
+
+```bash
+brew install colima docker docker-compose
+colima start
+docker compose up --build -d
+```
+
+Colima uses a different networking stack and does not have this issue.
+
 ### Overriding the bundled config
 
 The container image ships with a bundled `/app/config.toml` generated from
