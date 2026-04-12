@@ -498,3 +498,12 @@ docker compose up --build
 curl http://127.0.0.1:8317/healthz
 docker compose down -v
 ```
+
+---
+
+## Disclaimer
+
+`codex-proxy` is an independent open-source project and is not affiliated with,
+endorsed by, or associated with OpenAI, Codex, or any of their subsidiaries or
+related entities. All product names, trademarks, and registered trademarks are
+the property of their respective owners.
