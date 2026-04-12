@@ -7,6 +7,8 @@
 //!   and forwards requests to the ChatGPT Codex backend.
 //! - Request normalization (model canonicalization, `item_reference` filtering,
 //!   `store: false`, `reasoning.encrypted_content` injection).
+//! - A WebSocket compatibility transport on `GET /v1/responses` for Codex-style
+//!   realtime clients.
 //! - A non-streaming compatibility adapter for `POST /v1/chat/completions`.
 
 pub mod app;

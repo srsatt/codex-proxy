@@ -204,7 +204,10 @@ async fn complete_pasted_callback_flow(
     let parsed = parse_callback_url(callback_url)?;
 
     if let Some(error_code) = parsed.error.as_deref() {
-        let description = parsed.error_description.as_deref().unwrap_or("no description");
+        let description = parsed
+            .error_description
+            .as_deref()
+            .unwrap_or("no description");
         bail!("OAuth provider returned error `{error_code}`: {description}");
     }
 
@@ -236,7 +239,11 @@ async fn complete_pasted_callback_flow(
     Ok(())
 }
 
-fn finalize_successful_auth(paths: &AppPaths, fake_api_key: &str, tokens: &TokenStore) -> Result<()> {
+fn finalize_successful_auth(
+    paths: &AppPaths,
+    fake_api_key: &str,
+    tokens: &TokenStore,
+) -> Result<()> {
     save_tokens(paths, tokens)?;
 
     let mut updated_state = load_proxy_state(paths)?;
@@ -279,7 +286,10 @@ async fn wait_for_pasted_callback_code(expected_state: &str) -> Result<String> {
 
         let parsed = parse_callback_url(line)?;
         if let Some(error_code) = parsed.error.as_deref() {
-            let description = parsed.error_description.as_deref().unwrap_or("no description");
+            let description = parsed
+                .error_description
+                .as_deref()
+                .unwrap_or("no description");
             bail!("OAuth provider returned error `{error_code}`: {description}");
         }
 
@@ -291,9 +301,9 @@ async fn wait_for_pasted_callback_code(expected_state: &str) -> Result<String> {
             bail!("callback URL state did not match the pending OAuth flow");
         }
 
-        let code = parsed
-            .code
-            .ok_or_else(|| anyhow!("callback URL did not contain an authorization `code` parameter"))?;
+        let code = parsed.code.ok_or_else(|| {
+            anyhow!("callback URL did not contain an authorization `code` parameter")
+        })?;
 
         info!("received pasted OAuth callback URL from stdin");
         return Ok(code);
@@ -389,10 +399,9 @@ mod tests {
 
     #[test]
     fn parse_callback_url_reads_code_and_state_from_full_url() {
-        let parsed = parse_callback_url(
-            "http://localhost:1455/auth/callback?code=abc123&state=state-456",
-        )
-        .expect("parsed");
+        let parsed =
+            parse_callback_url("http://localhost:1455/auth/callback?code=abc123&state=state-456")
+                .expect("parsed");
 
         assert_eq!(
             parsed,

@@ -400,6 +400,9 @@ callback_port = 1455
 open_browser = true
 timeout_seconds = 300
 
+[upstream]
+keep_alive_interval_secs = 15
+
 [models]
 advertised = ["gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex"]
 fallback = "gpt-5.4"
@@ -454,7 +457,9 @@ x-api-key: sk-codex-proxy-<hex>
 | GET | `/readyz` | `200 OK` when forwarding is ready, `503` otherwise |
 | GET | `/v1/models` | OpenAI-compatible model list |
 | GET | `/v1/models/{model_id}` | Single model object or 404 |
+| GET | `/v1/responses` | WebSocket compatibility transport |
 | POST | `/v1/responses` | Primary forwarding route (streaming supported) |
+| POST | `/v1/responses/compact` | Compact response forwarding route |
 | POST | `/v1/chat/completions` | Non-streaming compat adapter |
 
 ### Health check response
@@ -497,6 +502,8 @@ Inside Docker (`WORKDIR /app`):
 
 - `POST /v1/chat/completions` does not support streaming. Use `POST /v1/responses`
   for streaming.
+- `GET /v1/responses` is a WebSocket transport intended for Codex-style clients;
+  standard OpenAI SDKs should keep using the HTTP `POST /v1/responses` route.
 - The proxy advertises only the models listed in `config.toml`; it does not
   mirror the full OpenAI model catalog.
 - Docker auth requires publishing the OAuth callback port (`1455` by default)

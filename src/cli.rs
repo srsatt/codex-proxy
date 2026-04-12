@@ -86,7 +86,11 @@ pub struct AuthArgs {
     /// Useful when the browser reaches `http://localhost:1455/auth/callback?...`
     /// but cannot connect to the waiting local callback server, for example in
     /// some Docker or remote-environment setups.
-    #[arg(long, value_name = "URL", help = "Complete auth using a pasted callback URL")]
+    #[arg(
+        long,
+        value_name = "URL",
+        help = "Complete auth using a pasted callback URL"
+    )]
     pub callback_url: Option<String>,
 
     /// Override the host embedded in the OAuth redirect URI.

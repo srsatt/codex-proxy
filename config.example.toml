@@ -26,6 +26,7 @@ client_id = "app_EMoamEEZ73f0CkXaXp7hrann"
 scope = "openid profile email offline_access"
 originator = "codex_cli_rs"
 beta_header = "responses=experimental"
+keep_alive_interval_secs = 15
 
 [request_defaults]
 include = ["reasoning.encrypted_content"]

@@ -8,6 +8,7 @@
 //! | GET    | `/readyz`                 | 200 when forwarding is ready, 503 otherwise          |
 //! | GET    | `/v1/models`              | Lists advertised models (OpenAI-compatible)          |
 //! | GET    | `/v1/models/{model_id}`   | Returns a single model object or 404                 |
+//! | GET    | `/v1/responses`           | WebSocket compatibility transport for responses      |
 //! | POST   | `/v1/responses`           | Forwards requests to the ChatGPT Codex backend       |
 //! | POST   | `/v1/responses/compact`   | Forwards compaction requests to the Codex backend    |
 //! | POST   | `/v1/chat/completions`    | Non-streaming chat completions compatibility adapter |
@@ -17,6 +18,7 @@
 
 mod chat_completions;
 mod forwarding;
+mod websocket;
 
 use std::sync::Arc;
 
@@ -43,6 +45,7 @@ use crate::{
 
 use self::chat_completions::forward_chat_completions;
 use self::forwarding::{ForwardingState, forward_responses, forward_responses_compact};
+use self::websocket::forward_v1_responses_websocket;
 
 /// Shared state cloned into every Axum handler via [`axum::extract::State`].
 ///
@@ -110,7 +113,10 @@ pub fn router(state: ProxyAppState) -> Router {
         .route("/readyz", get(readyz))
         .route("/v1/models", get(list_models))
         .route("/v1/models/{model_id}", get(get_model))
-        .route("/v1/responses", post(forward_v1_responses))
+        .route(
+            "/v1/responses",
+            get(forward_v1_responses_websocket).post(forward_v1_responses),
+        )
         .route("/v1/responses/compact", post(forward_v1_responses_compact))
         .route("/v1/chat/completions", post(forward_v1_chat_completions))
         .layer(CorsLayer::permissive())

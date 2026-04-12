@@ -17,14 +17,16 @@
 //!    - Non-streaming: parse the SSE stream, extract the final response
 //!      object, and return it as JSON.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, anyhow, bail};
+use async_stream::stream;
 use axum::{
     body::{Body, Bytes},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
+use futures_util::StreamExt;
 use reqwest::Client;
 use serde_json::{Value, json};
 use tokio::sync::RwLock;
@@ -184,7 +186,9 @@ pub async fn forward_responses(
         return map_upstream_error(upstream).await;
     }
 
-    match handle_success_response(upstream, prepared_request.original_stream).await {
+    let keep_alive_secs = state.config.upstream.keep_alive_interval_secs.unwrap_or(15);
+    match handle_success_response(upstream, prepared_request.original_stream, keep_alive_secs).await
+    {
         Ok(response) => response,
         Err(error) => {
             error_response_with_request_id(StatusCode::BAD_GATEWAY, error.to_string(), &request_id)
@@ -207,7 +211,11 @@ pub async fn forward_responses_compact(
 
     // Compact does not support streaming — reject early before parsing.
     if let Ok(body_json) = serde_json::from_slice::<Value>(&request_body) {
-        if body_json.get("stream").and_then(Value::as_bool).unwrap_or(false) {
+        if body_json
+            .get("stream")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
             tracing::warn!(%request_id, route_kind = "compact", "client sent stream: true to compact endpoint");
             return error_response_with_request_id(
                 StatusCode::BAD_REQUEST,
@@ -264,7 +272,8 @@ pub async fn forward_responses_compact(
         return map_upstream_error(upstream).await;
     }
 
-    match handle_success_response(upstream, false).await {
+    let keep_alive_secs = state.config.upstream.keep_alive_interval_secs.unwrap_or(15);
+    match handle_success_response(upstream, false, keep_alive_secs).await {
         Ok(response) => response,
         Err(error) => {
             error_response_with_request_id(StatusCode::BAD_GATEWAY, error.to_string(), &request_id)
@@ -295,7 +304,10 @@ pub async fn send_prepared_request(
     };
     let token_status = tokens.auth_status().as_str();
     let transformation = &prepared_request.transformation;
-    let model = transformation.normalized_model.as_deref().unwrap_or("unknown");
+    let model = transformation
+        .normalized_model
+        .as_deref()
+        .unwrap_or("unknown");
     let model_changed = transformation.original_model != transformation.normalized_model;
 
     if model_changed {
@@ -358,13 +370,8 @@ pub async fn send_prepared_request(
     const MAX_STRIP_RETRIES: usize = 10;
 
     for attempt in 0..=MAX_STRIP_RETRIES {
-        let upstream_headers = build_upstream_headers(
-            request_headers,
-            &tokens,
-            &state.config,
-            &body,
-            request_id,
-        )?;
+        let upstream_headers =
+            build_upstream_headers(request_headers, &tokens, &state.config, &body, request_id)?;
 
         let response = state
             .client
@@ -954,13 +961,19 @@ fn upstream_compact_url(config: &Config) -> Result<Url> {
 
 /// Convert a successful upstream response into an Axum [`Response`].
 ///
-/// - **Streaming** (`original_stream = true`): byte-streams the upstream
-///   SSE body directly to the client.
-/// - **Non-streaming**: reads the full SSE body, finds the `response.done`
-///   or `response.completed` event, and returns its `response` field as JSON.
+/// - **Streaming** (`original_stream = true`): byte-streams the upstream SSE
+///   body to the client with periodic `: keep-alive` heartbeat comments
+///   (every `keep_alive_secs` seconds, disabled when `0`) to prevent idle
+///   connection timeouts through load balancers. If the upstream stream errors
+///   mid-flight an SSE `event: error` frame is injected before closing.
+/// - **Non-streaming**: reads the full SSE body (sending periodic `\n`
+///   keep-alive whitespace so the client connection stays open), finds the
+///   `response.done` / `response.completed` event, and returns its `response`
+///   field as JSON.
 async fn handle_success_response(
     upstream: UpstreamExchange,
     original_stream: bool,
+    keep_alive_secs: u64,
 ) -> Result<Response> {
     let request_id = upstream.request_id;
     let upstream_request_id = upstream.upstream_request_id;
@@ -974,11 +987,57 @@ async fn handle_success_response(
     if original_stream {
         let status = response.status();
         let headers = response_headers(response.headers());
-        let stream = response.bytes_stream();
+        let upstream_stream = response.bytes_stream();
+
+        let body = if keep_alive_secs == 0 {
+            // Keep-alive disabled — forward bytes passively.
+            Body::from_stream(upstream_stream)
+        } else {
+            let interval_duration = Duration::from_secs(keep_alive_secs);
+            let body_stream = stream! {
+                let mut upstream = Box::pin(upstream_stream);
+                let mut interval = tokio::time::interval(interval_duration);
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                // Consume the first immediate tick so the first heartbeat only
+                // fires after a full interval has elapsed.
+                interval.tick().await;
+
+                loop {
+                    tokio::select! {
+                        chunk = upstream.next() => {
+                            match chunk {
+                                Some(Ok(bytes)) => yield Ok::<_, anyhow::Error>(bytes),
+                                Some(Err(e)) => {
+                                    // Inject an SSE error event so clients get an
+                                    // explanation instead of a silent EOF.
+                                    let error_json = json!({
+                                        "type": "error",
+                                        "code": "upstream_error",
+                                        "message": e.to_string(),
+                                        "sequence_number": 0
+                                    });
+                                    let frame = format!(
+                                        "event: error\ndata: {}\n\n",
+                                        error_json
+                                    );
+                                    yield Ok(Bytes::from(frame));
+                                    break;
+                                }
+                                None => break,
+                            }
+                        }
+                        _ = interval.tick() => {
+                            yield Ok(Bytes::from_static(b": keep-alive\n\n"));
+                        }
+                    }
+                }
+            };
+            Body::from_stream(body_stream)
+        };
 
         return Response::builder()
             .status(status)
-            .body(Body::from_stream(stream))
+            .body(body)
             .map(|mut response| {
                 *response.headers_mut() = headers;
                 attach_diagnostic_headers(
@@ -991,28 +1050,119 @@ async fn handle_success_response(
             .context("failed to build streaming proxy response");
     }
 
+    // Non-streaming path: the client expects a single JSON object.
+    // We spawn the upstream body read on a task and send periodic `\n`
+    // keep-alive whitespace (valid JSON leading whitespace per RFC 8259) so
+    // the connection doesn't go idle while waiting for a long upstream call.
     let status = response.status();
-    let text = response
-        .text()
-        .await
-        .context("failed to read upstream SSE response")?;
-    let json_response = match parse_success_text_to_json(&text) {
-        Some(json) => json,
-        None => {
-            tracing::warn!(
-                %request_id,
-                upstream_request_id = upstream_request_id.as_deref().unwrap_or("missing"),
-                body_summary = %redact_sensitive_text(&text),
-                "successful upstream response did not contain a parseable final JSON payload; returning raw text envelope"
-            );
-            Value::String(text)
+    let (tx, rx) = tokio::sync::oneshot::channel::<reqwest::Result<String>>();
+    tokio::spawn(async move {
+        let _ = tx.send(response.text().await);
+    });
+
+    let request_id_clone = request_id.clone();
+    let upstream_request_id_clone = upstream_request_id.clone();
+
+    let body_stream = stream! {
+        let mut rx = rx;
+
+        if keep_alive_secs > 0 {
+            let interval_duration = Duration::from_secs(keep_alive_secs);
+            let mut interval = tokio::time::interval(interval_duration);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            interval.tick().await; // consume first immediate tick
+
+            loop {
+                tokio::select! {
+                    result = &mut rx => {
+                        let text = match result {
+                            Ok(Ok(text)) => text,
+                            Ok(Err(error)) => {
+                                yield Err::<Bytes, anyhow::Error>(
+                                    anyhow!("failed to read upstream SSE response: {error}")
+                                );
+                                break;
+                            }
+                            Err(_) => {
+                                yield Err::<Bytes, anyhow::Error>(
+                                    anyhow!("upstream reader task dropped unexpectedly")
+                                );
+                                break;
+                            }
+                        };
+                        let json_response = match parse_success_text_to_json(&text) {
+                            Some(json) => json,
+                            None => {
+                                tracing::warn!(
+                                    request_id = %request_id_clone,
+                                    upstream_request_id = upstream_request_id_clone
+                                        .as_deref()
+                                        .unwrap_or("missing"),
+                                    body_summary = %redact_sensitive_text(&text),
+                                    "successful upstream response did not contain a parseable \
+                                     final JSON payload; returning raw text envelope"
+                                );
+                                Value::String(text)
+                            }
+                        };
+                        match serde_json::to_vec(&json_response) {
+                            Ok(json_bytes) => yield Ok::<_, anyhow::Error>(Bytes::from(json_bytes)),
+                            Err(error) => yield Err::<Bytes, anyhow::Error>(
+                                error.into()
+                            ),
+                        }
+                        break;
+                    }
+                    _ = interval.tick() => {
+                        // Leading JSON whitespace — ignored by all conforming parsers.
+                        yield Ok(Bytes::from_static(b"\n"));
+                    }
+                }
+            }
+        } else {
+            // Keep-alive disabled — await the body directly.
+            let result = rx.await;
+            let text = match result {
+                Ok(Ok(text)) => text,
+                Ok(Err(error)) => {
+                    yield Err::<Bytes, anyhow::Error>(
+                        anyhow!("failed to read upstream SSE response: {error}")
+                    );
+                    return;
+                }
+                Err(_) => {
+                    yield Err::<Bytes, anyhow::Error>(
+                        anyhow!("upstream reader task dropped unexpectedly")
+                    );
+                    return;
+                }
+            };
+            let json_response = match parse_success_text_to_json(&text) {
+                Some(json) => json,
+                None => {
+                    tracing::warn!(
+                        request_id = %request_id_clone,
+                        upstream_request_id = upstream_request_id_clone
+                            .as_deref()
+                            .unwrap_or("missing"),
+                        body_summary = %redact_sensitive_text(&text),
+                        "successful upstream response did not contain a parseable \
+                         final JSON payload; returning raw text envelope"
+                    );
+                    Value::String(text)
+                }
+            };
+            match serde_json::to_vec(&json_response) {
+                Ok(json_bytes) => yield Ok::<_, anyhow::Error>(Bytes::from(json_bytes)),
+                Err(error) => yield Err::<Bytes, anyhow::Error>(error.into()),
+            }
         }
     };
 
     Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, "application/json; charset=utf-8")
-        .body(Body::from(serde_json::to_vec(&json_response)?))
+        .body(Body::from_stream(body_stream))
         .map(|mut response| {
             attach_diagnostic_headers(
                 response.headers_mut(),
@@ -1150,7 +1300,11 @@ fn extract_unsupported_param(body: &[u8]) -> Option<String> {
 
     let try_extract = |s: &str| -> Option<String> {
         let param = s.strip_prefix("Unsupported parameter: ")?;
-        if param.is_empty() { None } else { Some(param.to_owned()) }
+        if param.is_empty() {
+            None
+        } else {
+            Some(param.to_owned())
+        }
     };
 
     // Shape 1: {"detail": "Unsupported parameter: X"}
@@ -1538,10 +1692,7 @@ data: {\"type\":\"response.done\",\"response\":{\"id\":\"resp_123\",\"object\":\
     #[test]
     fn extract_unsupported_param_handles_openai_error_message_shape() {
         let body = br#"{"error":{"message":"Unsupported parameter: top_p","type":"invalid_request_error"}}"#;
-        assert_eq!(
-            extract_unsupported_param(body),
-            Some("top_p".to_owned())
-        );
+        assert_eq!(extract_unsupported_param(body), Some("top_p".to_owned()));
     }
 
     #[test]

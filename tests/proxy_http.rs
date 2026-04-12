@@ -16,9 +16,14 @@ use codex_proxy::{
     state::{TokenStore, load_tokens},
     time::unix_timestamp_secs,
 };
+use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tempfile::{TempDir, tempdir};
 use tokio::{net::TcpListener, sync::Mutex, task::JoinHandle};
+use tokio_tungstenite::{
+    connect_async,
+    tungstenite::{Message, client::IntoClientRequest},
+};
 use tower::util::ServiceExt;
 
 #[derive(Clone)]
@@ -52,6 +57,17 @@ struct MockUpstream {
     responses_requests: Arc<Mutex<Vec<RecordedRequest>>>,
     token_requests: Arc<Mutex<Vec<String>>>,
     task: JoinHandle<()>,
+}
+
+struct SpawnedApp {
+    addr: SocketAddr,
+    task: JoinHandle<()>,
+}
+
+impl Drop for SpawnedApp {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 impl Drop for MockUpstream {
@@ -177,6 +193,16 @@ fn make_proxy_app(
         fake_api_key.to_owned(),
         tokens,
     ))
+}
+
+async fn spawn_proxy_app(app: Router) -> SpawnedApp {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+    let addr = listener.local_addr().expect("addr");
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("proxy server");
+    });
+
+    SpawnedApp { addr, task }
 }
 
 fn make_token(account_id: &str, refresh_token: &str, expires_at: i64) -> TokenStore {
@@ -615,4 +641,118 @@ async fn chat_completions_route_rejects_streaming_requests() {
     assert!(response.headers().contains_key("x-codex-proxy-request-id"));
     let payload = read_json(response).await;
     assert_eq!(payload["error"]["type"], "proxy_error");
+}
+
+#[tokio::test]
+async fn chat_completions_route_reports_misrouted_responses_payloads() {
+    let temp = tempdir().expect("tempdir");
+    let paths = test_paths(&temp);
+    paths.ensure_runtime_layout().expect("runtime layout");
+    let app = make_proxy_app(Config::default(), paths, "sk-codex-proxy-test", None);
+
+    let response = app
+        .oneshot(auth_json_request(
+            "/v1/chat/completions",
+            "sk-codex-proxy-test",
+            &json!({
+                "model": "gpt-5.4",
+                "instructions": "Be concise.",
+                "input": [{ "type": "message", "role": "user", "content": "hello" }]
+            }),
+        ))
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let payload = read_json(response).await;
+    assert!(
+        payload["error"]["message"]
+            .as_str()
+            .expect("error message")
+            .contains("POST /v1/responses")
+    );
+}
+
+#[tokio::test]
+async fn responses_websocket_route_forwards_sse_events_as_websocket_frames() {
+    let upstream = MockUpstream::spawn(
+        StatusCode::OK,
+        "text/event-stream; charset=utf-8",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_ws\",\"object\":\"response\"}}\n\n\
+data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_ws\",\"object\":\"response\",\"status\":\"completed\"}}\n\n",
+        None,
+    )
+    .await;
+
+    let temp = tempdir().expect("tempdir");
+    let paths = test_paths(&temp);
+    paths.ensure_runtime_layout().expect("runtime layout");
+    let app = make_proxy_app(
+        make_config(&upstream),
+        paths,
+        "sk-codex-proxy-test",
+        Some(make_token(
+            "account-123",
+            "refresh-123",
+            unix_timestamp_secs() + 3600,
+        )),
+    );
+    let server = spawn_proxy_app(app).await;
+
+    let mut request = format!("ws://{}/v1/responses", server.addr)
+        .into_client_request()
+        .expect("websocket request");
+    request.headers_mut().insert(
+        header::AUTHORIZATION,
+        "Bearer sk-codex-proxy-test".parse().expect("auth header"),
+    );
+
+    let (mut socket, response) = connect_async(request).await.expect("websocket connect");
+    assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+
+    socket
+        .send(Message::Text(
+            json!({
+                "type": "response.create",
+                "response": {
+                    "model": "openai/gpt-5-codex",
+                    "stream": true,
+                    "input": [{ "type": "message", "role": "user", "content": "hello" }]
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send websocket request");
+
+    let created = socket
+        .next()
+        .await
+        .expect("created frame")
+        .expect("created frame result")
+        .into_text()
+        .expect("created text");
+    let completed = socket
+        .next()
+        .await
+        .expect("completed frame")
+        .expect("completed frame result")
+        .into_text()
+        .expect("completed text");
+
+    assert_eq!(
+        serde_json::from_str::<Value>(&created).expect("created json")["type"],
+        "response.created"
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&completed).expect("completed json")["type"],
+        "response.completed"
+    );
+
+    let recorded = upstream.responses_requests.lock().await;
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0].body["model"], "gpt-5.3-codex");
+    assert_eq!(recorded[0].body["store"], false);
+    assert_eq!(recorded[0].body["stream"], true);
 }

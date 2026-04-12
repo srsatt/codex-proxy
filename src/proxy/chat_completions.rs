@@ -128,10 +128,17 @@ pub fn translate_chat_completions_request(
         .get("model")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("chat completions request is missing `model`"))?;
-    let messages = object
-        .get("messages")
-        .and_then(Value::as_array)
-        .ok_or_else(|| anyhow!("chat completions request is missing `messages`"))?;
+    let messages = match object.get("messages").and_then(Value::as_array) {
+        Some(messages) => messages,
+        None => {
+            if object.contains_key("input") || object.contains_key("instructions") {
+                bail!(
+                    "request appears to be in Responses API format (has `input`/`instructions` but no `messages`); send it to `POST /v1/responses` instead"
+                );
+            }
+            bail!("chat completions request is missing `messages`");
+        }
+    };
     if messages.is_empty() {
         bail!("chat completions request must include at least one message");
     }
@@ -192,7 +199,9 @@ async fn adapt_chat_completions_response(upstream: UpstreamExchange) -> Result<R
         extract_success_response_json(match upstream.body {
             crate::proxy::forwarding::UpstreamExchangeBody::Live(r) => r,
             crate::proxy::forwarding::UpstreamExchangeBody::Buffered(_) => {
-                return Err(anyhow::anyhow!("unexpected buffered body on success response"));
+                return Err(anyhow::anyhow!(
+                    "unexpected buffered body on success response"
+                ));
             }
         })
         .await?;
@@ -653,8 +662,8 @@ mod tests {
     }
 
     #[test]
-    fn translate_chat_completions_request_explicit_reasoning_object_takes_priority_over_reasoning_effort(
-    ) {
+    fn translate_chat_completions_request_explicit_reasoning_object_takes_priority_over_reasoning_effort()
+     {
         let models = ModelsConfig::default();
         // When both `reasoning` and `reasoning_effort` are present, the explicit
         // `reasoning` object wins and `reasoning_effort` is ignored.
@@ -673,6 +682,28 @@ mod tests {
         .expect("prepared request");
 
         assert_eq!(prepared.body["reasoning"]["effort"], "low");
+    }
+
+    #[test]
+    fn translate_chat_completions_request_rejects_responses_format_payloads() {
+        let models = ModelsConfig::default();
+        let request = json!({
+            "model": "gpt-5.4",
+            "input": [{ "type": "message", "role": "user", "content": "hi" }]
+        });
+
+        let error = translate_chat_completions_request(
+            serde_json::to_vec(&request).expect("request").as_slice(),
+            &Config::default().request_defaults,
+            &models,
+        )
+        .expect_err("responses-format payload should be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("send it to `POST /v1/responses` instead")
+        );
     }
 
     #[test]

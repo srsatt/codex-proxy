@@ -41,6 +41,7 @@ src/
   proxy/
     mod.rs                 — Axum router, ProxyAppState, route handlers, auth gate
     forwarding.rs          — request normalization, upstream forwarding, SSE handling
+    websocket.rs           — GET /v1/responses WebSocket compatibility transport
     chat_completions.rs    — POST /v1/chat/completions compatibility adapter
 
 tests/
@@ -90,7 +91,7 @@ expiring or expired. Refreshed tokens are persisted to `tokens.json` and
 updated in the in-memory `Arc<RwLock<Option<TokenStore>>>`.
 
 ### Request Normalization (`prepare_request_body`)
-Every `POST /v1/responses` request is normalized before forwarding:
+Every responses request forwarded upstream is normalized before forwarding:
 - Model name canonicalized via `ModelsConfig::canonicalize` (alias map + fallback).
 - `store: false` forced (backend must not cache).
 - `stream: true` forced (proxy always streams from backend).
@@ -105,11 +106,19 @@ Every `POST /v1/responses` request is normalized before forwarding:
 pipeline, then the response is converted back by `responses_to_chat_completion`.
 Streaming is not yet supported on this route.
 
+### WebSocket Transport
+`GET /v1/responses` upgrades to a WebSocket for Codex-style clients. Incoming
+`response.create` / `response.append` messages are converted back into the same
+responses request pipeline used by `POST /v1/responses`, and upstream SSE
+`data:` lines are forwarded to the client as WebSocket text frames.
+
 ### SSE Handling
-The upstream always returns an SSE stream. For streaming clients the bytes are
-piped directly. For non-streaming clients `parse_sse_final_response` scans for
-a `response.done` or `response.completed` event and returns its `response`
-field as JSON.
+The upstream always returns an SSE stream. For streaming HTTP clients the proxy
+adds periodic `: keep-alive` comments and injects an `event: error` frame if
+the upstream stream fails mid-flight. For non-streaming HTTP clients the proxy
+sends leading JSON whitespace keep-alives while waiting, then
+`parse_sse_final_response` scans for a `response.done` or
+`response.completed` event and returns its `response` field as JSON.
 
 ---
 
@@ -121,7 +130,9 @@ field as JSON.
 | GET | `/readyz` | No | 200 = forwarding ready, 503 = not ready |
 | GET | `/v1/models` | Yes | Lists `config.models.advertised` |
 | GET | `/v1/models/{model_id}` | Yes | 404 if model not in advertised list |
+| GET | `/v1/responses` | Yes | WebSocket compatibility transport |
 | POST | `/v1/responses` | Yes | Primary forwarding route |
+| POST | `/v1/responses/compact` | Yes | Compact response forwarding route |
 | POST | `/v1/chat/completions` | Yes | Non-streaming compat adapter |
 
 ---
@@ -143,6 +154,8 @@ first run. See `config.example.toml` for an annotated reference.
 | `auth.timeout_seconds` | `300` | Seconds to wait for OAuth callback |
 | `upstream.responses_base_url` | `https://chatgpt.com/backend-api` | ChatGPT backend |
 | `upstream.codex_responses_path` | `/codex/responses` | Codex endpoint path |
+| `upstream.codex_compact_path` | `/codex/responses/compact` | Codex compact endpoint path |
+| `upstream.keep_alive_interval_secs` | `15` | HTTP keep-alive heartbeat interval; `0` disables it |
 | `models.advertised` | `["gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex"]` | Models returned by /v1/models |
 | `models.fallback` | `gpt-5.4` | Model used when no alias matches |
 | `models.aliases` | see config.example.toml | Provider-prefixed → canonical name map |

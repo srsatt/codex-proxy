@@ -214,6 +214,10 @@ pub struct UpstreamConfig {
     /// Value sent in the `OpenAI-Beta` header to opt in to the experimental
     /// responses API. Default: `responses=experimental`.
     pub beta_header: String,
+    /// Interval in seconds between SSE keep-alive comment heartbeats sent to
+    /// clients during streaming responses. Set to `0` to disable. Default: `15`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keep_alive_interval_secs: Option<u64>,
 }
 
 impl Default for UpstreamConfig {
@@ -228,6 +232,7 @@ impl Default for UpstreamConfig {
             scope: "openid profile email offline_access".to_owned(),
             originator: "codex_cli_rs".to_owned(),
             beta_header: "responses=experimental".to_owned(),
+            keep_alive_interval_secs: Some(15),
         }
     }
 }
