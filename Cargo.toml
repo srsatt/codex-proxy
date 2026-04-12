@@ -2,6 +2,7 @@
 name = "codex-proxy"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.94"
 
 [dependencies]
 base64 = "0.22.1"

@@ -120,11 +120,17 @@ authenticate via `docker exec` and handle the browser step manually:
 
 ```bash
 docker exec -it codex-proxy-codex-proxy-1 \
-  /app/codex-proxy auth --no-browser
+  codex-proxy auth --no-browser
 ```
 
 > **Note**: the container name is `codex-proxy-codex-proxy-1` with the default
 > Compose project name. Run `docker ps` to confirm the exact name.
+
+If you prefer Compose-aware exec, use:
+
+```bash
+docker compose exec codex-proxy codex-proxy auth --no-browser
+```
 
 The command prints an authorization URL:
 
