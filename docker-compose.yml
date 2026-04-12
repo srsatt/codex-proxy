@@ -10,7 +10,8 @@ services:
       # Local proxy endpoint for tools like Droid, Zed, or OpenCode.
       - "127.0.0.1:8317:8317"
       # OAuth callback listener used by:
-      #   docker compose exec codex-proxy codex-proxy auth --no-browser
+      #   docker compose exec codex-proxy \
+      #     codex-proxy auth --no-browser --callback-bind-host 0.0.0.0
       # Keep this published so the browser redirect can reach the container.
       - "127.0.0.1:1455:1455"
     volumes:

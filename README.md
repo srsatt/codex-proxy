@@ -30,7 +30,7 @@ proxied to the ChatGPT Codex backend - no real OpenAI API key required.
 ## Prerequisites
 
 **Local binary**
-- Rust 1.75+ (`rustup` recommended)
+- Rust 1.94+ (`rustup` recommended)
 - `openssl` on `PATH` (used to generate the fake API key)
 
 **Docker**
@@ -120,7 +120,7 @@ authenticate via `docker exec` and handle the browser step manually:
 
 ```bash
 docker exec -it codex-proxy \
-  codex-proxy auth --no-browser
+  codex-proxy auth --no-browser --callback-bind-host 0.0.0.0
 ```
 
 > **Note**: the bundled Compose file sets `container_name: codex-proxy`. If
@@ -129,7 +129,8 @@ docker exec -it codex-proxy \
 If you prefer Compose-aware exec, use:
 
 ```bash
-docker compose exec codex-proxy codex-proxy auth --no-browser
+docker compose exec codex-proxy \
+  codex-proxy auth --no-browser --callback-bind-host 0.0.0.0
 ```
 
 The command prints an authorization URL:
@@ -141,9 +142,13 @@ https://auth.openai.com/oauth/authorize?...
 ```
 
 Open that URL in a browser on your host machine. After you log in and grant
-access, ChatGPT redirects to `http://127.0.0.1:1455/auth/callback` — which
-must be reachable *inside* the container. To make this work, the callback port
-must be published. Add or confirm this in your `docker-compose.yml`:
+access, ChatGPT redirects to `http://localhost:1455/auth/callback`. The
+listener inside the container must therefore bind to `0.0.0.0` so the
+published port can reach it, which is why the command above includes
+`--callback-bind-host 0.0.0.0`.
+
+The callback port must also be published. Add or confirm this in your
+`docker-compose.yml`:
 
 ```yaml
 services:
@@ -208,7 +213,9 @@ volumes:
 1. Generates a PKCE verifier/challenge pair.
 2. Opens `https://auth.openai.com/oauth/authorize?...` in your browser
    (or prints the URL if `--no-browser` is set).
-3. Starts a local HTTP server on `127.0.0.1:1455` to receive the callback.
+3. Starts a local HTTP server on `callback_bind_host:callback_port`
+   (`127.0.0.1:1455` by default) and registers the OAuth redirect URI
+   `http://localhost:1455/auth/callback` by default.
 4. Exchanges the authorization code for access + refresh tokens.
 5. Saves tokens to `data/tokens.json` and prints the fake API key.
 
@@ -293,7 +300,8 @@ Commands:
 ```
 --no-browser          Print the authorization URL instead of opening a browser
 --force               Start a new login even when stored tokens are valid
---callback-host <HOST>  Override the OAuth callback host
+--callback-host <HOST>  Override the OAuth redirect host
+--callback-bind-host <HOST>  Override the OAuth callback bind host
 --callback-port <PORT>  Override the OAuth callback port
 ```
 
@@ -314,7 +322,8 @@ port = 8317           # proxy listen port
 log_filter = "info"   # tracing filter (same syntax as RUST_LOG)
 
 [auth]
-callback_host = "127.0.0.1"
+callback_bind_host = "127.0.0.1"
+redirect_host = "localhost"
 callback_port = 1455
 open_browser = true
 timeout_seconds = 300
@@ -338,6 +347,10 @@ fallback = "gpt-5.4"
 ```bash
 RUST_LOG=debug codex-proxy start
 ```
+
+**Docker auth**: when running `codex-proxy auth` inside a container, keep
+`redirect_host = "localhost"` and use `--callback-bind-host 0.0.0.0` so the
+published callback port can reach the temporary listener.
 
 ---
 

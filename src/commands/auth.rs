@@ -35,12 +35,16 @@ pub async fn run(paths: AppPaths, args: AuthArgs) -> Result<()> {
     paths.ensure_runtime_layout()?;
 
     let config = Config::load_or_create(&paths)?;
-    let callback_host = args
+    let redirect_host = args
         .callback_host
         .clone()
-        .unwrap_or_else(|| config.auth.callback_host.clone());
+        .unwrap_or_else(|| config.auth.redirect_host.clone());
+    let callback_bind_host = args
+        .callback_bind_host
+        .clone()
+        .unwrap_or_else(|| config.auth.callback_bind_host.clone());
     let callback_port = args.callback_port.unwrap_or(config.auth.callback_port);
-    let redirect_uri = callback_url(&callback_host, callback_port);
+    let redirect_uri = callback_url(&redirect_host, callback_port);
     let fake_api_key = ensure_fake_api_key(&paths)?;
     let existing_tokens = load_tokens(&paths)?;
     let client = Client::new();
@@ -100,13 +104,16 @@ pub async fn run(paths: AppPaths, args: AuthArgs) -> Result<()> {
     }
 
     info!(
-        callback_host,
-        callback_port, "Waiting for the ChatGPT OAuth callback"
+        callback_bind_host,
+        redirect_host,
+        callback_port,
+        %redirect_uri,
+        "Waiting for the ChatGPT OAuth callback"
     );
 
     let auth_result = complete_oauth_flow(
         &config,
-        &callback_host,
+        &callback_bind_host,
         callback_port,
         &auth_flow.state,
         &auth_flow.pkce_verifier,
@@ -146,14 +153,14 @@ pub async fn run(paths: AppPaths, args: AuthArgs) -> Result<()> {
 
 async fn complete_oauth_flow(
     config: &Config,
-    callback_host: &str,
+    callback_bind_host: &str,
     callback_port: u16,
     expected_state: &str,
     pkce_verifier: &str,
     redirect_uri: &str,
 ) -> Result<crate::state::TokenStore> {
     let code = wait_for_authorization_code(
-        callback_host,
+        callback_bind_host,
         callback_port,
         expected_state,
         Duration::from_secs(config.auth.timeout_seconds),

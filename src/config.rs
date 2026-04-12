@@ -16,7 +16,7 @@
 use std::{collections::BTreeMap, fs, path::Path};
 
 use anyhow::Result;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::{constants::CALLBACK_PATH, paths::AppPaths, storage::write_string};
 
@@ -97,11 +97,19 @@ impl Default for ServerConfig {
 }
 
 /// OAuth callback listener settings used during `codex-proxy auth`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, Serialize)]
 pub struct AuthConfig {
     /// Host the temporary OAuth callback server binds on. Default: `127.0.0.1`.
-    pub callback_host: String,
+    ///
+    /// When authenticating from inside Docker, this typically needs to be
+    /// `0.0.0.0` so the published callback port can reach the container.
+    pub callback_bind_host: String,
+    /// Host embedded in the OAuth `redirect_uri`. Default: `localhost`.
+    ///
+    /// The current first-party Codex OAuth client uses `localhost` in the
+    /// registered redirect URI; using `127.0.0.1` can cause the upstream auth
+    /// page to fail before the callback is reached.
+    pub redirect_host: String,
     /// Port the temporary OAuth callback server listens on. Default: `1455`.
     pub callback_port: u16,
     /// Whether to attempt to open the authorization URL in the system browser
@@ -117,7 +125,7 @@ impl AuthConfig {
     pub fn redirect_uri(&self) -> String {
         format!(
             "http://{}:{}{}",
-            self.callback_host, self.callback_port, CALLBACK_PATH
+            self.redirect_host, self.callback_port, CALLBACK_PATH
         )
     }
 }
@@ -125,11 +133,55 @@ impl AuthConfig {
 impl Default for AuthConfig {
     fn default() -> Self {
         Self {
-            callback_host: "127.0.0.1".to_owned(),
+            callback_bind_host: "127.0.0.1".to_owned(),
+            redirect_host: "localhost".to_owned(),
             callback_port: 1455,
             open_browser: true,
             timeout_seconds: 300,
         }
+    }
+}
+
+impl<'de> Deserialize<'de> for AuthConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Debug, Default, Deserialize)]
+        #[serde(default)]
+        struct RawAuthConfig {
+            callback_host: Option<String>,
+            callback_bind_host: Option<String>,
+            redirect_host: Option<String>,
+            callback_port: Option<u16>,
+            open_browser: Option<bool>,
+            timeout_seconds: Option<u64>,
+        }
+
+        let raw = RawAuthConfig::deserialize(deserializer)?;
+        let defaults = AuthConfig::default();
+        let legacy_callback_host = raw.callback_host.as_deref().map(str::trim);
+
+        let callback_bind_host = raw
+            .callback_bind_host
+            .or_else(|| raw.callback_host.clone())
+            .unwrap_or(defaults.callback_bind_host);
+
+        let redirect_host = raw
+            .redirect_host
+            .unwrap_or_else(|| match legacy_callback_host {
+                Some("127.0.0.1") | Some("0.0.0.0") => "localhost".to_owned(),
+                Some(host) if !host.is_empty() => host.to_owned(),
+                _ => defaults.redirect_host,
+            });
+
+        Ok(Self {
+            callback_bind_host,
+            redirect_host,
+            callback_port: raw.callback_port.unwrap_or(defaults.callback_port),
+            open_browser: raw.open_browser.unwrap_or(defaults.open_browser),
+            timeout_seconds: raw.timeout_seconds.unwrap_or(defaults.timeout_seconds),
+        })
     }
 }
 
@@ -326,9 +378,10 @@ mod tests {
 
         assert!(paths.config_path.exists());
         assert_eq!(config.server.port, 8317);
+        assert_eq!(config.auth.callback_bind_host, "127.0.0.1");
         assert_eq!(
             config.auth.redirect_uri(),
-            "http://127.0.0.1:1455/auth/callback"
+            "http://localhost:1455/auth/callback"
         );
         assert_eq!(
             config.request_defaults.include,
@@ -343,6 +396,41 @@ mod tests {
             ]
         );
         assert_eq!(config.models.fallback, "gpt-5.4");
+    }
+
+    #[test]
+    fn auth_config_deserialize_migrates_legacy_callback_host_to_localhost_redirect() {
+        let config: Config = toml::from_str(
+            r#"
+[auth]
+callback_host = "127.0.0.1"
+callback_port = 1455
+"#,
+        )
+        .expect("config");
+
+        assert_eq!(config.auth.callback_bind_host, "127.0.0.1");
+        assert_eq!(config.auth.redirect_host, "localhost");
+        assert_eq!(
+            config.auth.redirect_uri(),
+            "http://localhost:1455/auth/callback"
+        );
+    }
+
+    #[test]
+    fn auth_config_deserialize_supports_explicit_bind_and_redirect_hosts() {
+        let config: Config = toml::from_str(
+            r#"
+[auth]
+callback_bind_host = "0.0.0.0"
+redirect_host = "localhost"
+callback_port = 1455
+"#,
+        )
+        .expect("config");
+
+        assert_eq!(config.auth.callback_bind_host, "0.0.0.0");
+        assert_eq!(config.auth.redirect_host, "localhost");
     }
 
     #[test]

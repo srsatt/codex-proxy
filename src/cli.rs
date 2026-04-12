@@ -81,9 +81,17 @@ pub struct AuthArgs {
     )]
     pub force: bool,
 
-    /// Override the host the local OAuth callback server binds on.
-    #[arg(long, value_name = "HOST", help = "Override the OAuth callback host")]
+    /// Override the host embedded in the OAuth redirect URI.
+    #[arg(long, value_name = "HOST", help = "Override the OAuth redirect host")]
     pub callback_host: Option<String>,
+
+    /// Override the host the local OAuth callback server binds on.
+    #[arg(
+        long,
+        value_name = "HOST",
+        help = "Override the OAuth callback bind host"
+    )]
+    pub callback_bind_host: Option<String>,
 
     /// Override the port the local OAuth callback server listens on.
     #[arg(long, value_name = "PORT", help = "Override the OAuth callback port")]

@@ -280,7 +280,7 @@ mod tests {
     #[test]
     fn build_authorization_flow_uses_expected_parameters() {
         let upstream = UpstreamConfig::default();
-        let redirect_uri = "http://127.0.0.1:1455/auth/callback";
+        let redirect_uri = "http://localhost:1455/auth/callback";
 
         let flow = build_authorization_flow(&upstream, redirect_uri).expect("flow");
         let url = Url::parse(&flow.authorize_url).expect("url");

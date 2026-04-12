@@ -4,10 +4,16 @@ port = 8317
 log_filter = "info"
 
 [auth]
-callback_host = "127.0.0.1"
+callback_bind_host = "127.0.0.1"
+redirect_host = "localhost"
 callback_port = 1455
 open_browser = true
 timeout_seconds = 300
+
+# Docker auth note:
+# - keep redirect_host = "localhost"
+# - run `codex-proxy auth --no-browser --callback-bind-host 0.0.0.0`
+#   so the published callback port can reach the temporary listener
 
 [upstream]
 responses_base_url = "https://chatgpt.com/backend-api"
