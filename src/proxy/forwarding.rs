@@ -41,6 +41,7 @@ pub struct TransformationSummary {
     pub input_items_after: usize,
     pub filtered_item_references: usize,
     pub stripped_item_ids: usize,
+    pub dropped_orphaned_tool_outputs: usize,
     pub include_reasoning_added: bool,
 }
 
@@ -50,6 +51,7 @@ pub struct InputNormalizationStats {
     pub input_items_after: usize,
     pub filtered_item_references: usize,
     pub stripped_item_ids: usize,
+    pub dropped_orphaned_tool_outputs: usize,
 }
 
 pub async fn forward_responses(
@@ -123,6 +125,7 @@ pub async fn send_prepared_request(
         input_items_after = transformation.input_items_after,
         filtered_item_references = transformation.filtered_item_references,
         stripped_item_ids = transformation.stripped_item_ids,
+        dropped_orphaned_tool_outputs = transformation.dropped_orphaned_tool_outputs,
         include_reasoning_added = transformation.include_reasoning_added,
         "forwarding request to upstream"
     );
@@ -190,6 +193,7 @@ pub fn prepare_request_body(body: &[u8], models: &ModelsConfig) -> Result<Prepar
             input_items_after: input_stats.input_items_after,
             filtered_item_references: input_stats.filtered_item_references,
             stripped_item_ids: input_stats.stripped_item_ids,
+            dropped_orphaned_tool_outputs: input_stats.dropped_orphaned_tool_outputs,
             include_reasoning_added,
         },
     })
@@ -226,6 +230,38 @@ pub fn normalize_input(input: &mut Value) -> InputNormalizationStats {
         normalized_items.push(Value::Object(object));
     }
 
+    // Collect call_ids from all function_call items that survived filtering.
+    let live_call_ids: std::collections::HashSet<String> = normalized_items
+        .iter()
+        .filter_map(|item| {
+            let obj = item.as_object()?;
+            if obj.get("type").and_then(Value::as_str)? == "function_call" {
+                obj.get("call_id")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // Drop function_call_output items whose matching function_call was filtered out.
+    let mut dropped_orphaned_tool_outputs = 0;
+    normalized_items.retain(|item| {
+        let Some(obj) = item.as_object() else {
+            return true;
+        };
+        if obj.get("type").and_then(Value::as_str) != Some("function_call_output") {
+            return true;
+        }
+        let call_id = obj.get("call_id").and_then(Value::as_str).unwrap_or("");
+        if live_call_ids.contains(call_id as &str) {
+            return true;
+        }
+        dropped_orphaned_tool_outputs += 1;
+        false
+    });
+
     *items = normalized_items;
 
     InputNormalizationStats {
@@ -233,6 +269,7 @@ pub fn normalize_input(input: &mut Value) -> InputNormalizationStats {
         input_items_after: items.len(),
         filtered_item_references,
         stripped_item_ids,
+        dropped_orphaned_tool_outputs,
     }
 }
 
@@ -497,6 +534,7 @@ mod tests {
                 input_items_after: 2,
                 filtered_item_references: 1,
                 stripped_item_ids: 2,
+                dropped_orphaned_tool_outputs: 0,
                 include_reasoning_added: true,
             }
         );
@@ -557,5 +595,40 @@ data: {\"type\":\"response.done\",\"response\":{\"id\":\"resp_123\",\"object\":\
 
         assert_eq!(parsed["id"], "resp_123");
         assert_eq!(parsed["object"], "response");
+    }
+
+    #[test]
+    fn normalize_input_drops_orphaned_function_call_outputs() {
+        // Simulate what happens after item_reference filtering removes the
+        // function_call that a function_call_output was paired with: the
+        // output has no live sibling and must be dropped to avoid an upstream
+        // API error.
+        let mut input = json!([
+            {
+                "type": "function_call",
+                "call_id": "call_alive",
+                "name": "read_file",
+                "arguments": "{}"
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_alive",
+                "output": "file contents"
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_orphan",
+                "output": "stale output"
+            }
+        ]);
+
+        let stats = normalize_input(&mut input);
+
+        let items = input.as_array().expect("array");
+        assert_eq!(items.len(), 2);
+        assert!(items.iter().all(|i| i["call_id"] != "call_orphan"));
+        assert_eq!(stats.dropped_orphaned_tool_outputs, 1);
+        assert_eq!(stats.input_items_before, 3);
+        assert_eq!(stats.input_items_after, 2);
     }
 }

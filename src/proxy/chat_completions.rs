@@ -98,13 +98,11 @@ pub fn translate_chat_completions_request(
     copy_field(object, &mut responses_body, "prompt_cache_key");
     copy_field(object, &mut responses_body, "text");
 
-    if let Some(max_completion_tokens) = object.get("max_completion_tokens") {
-        responses_body.insert(
-            "max_completion_tokens".to_owned(),
-            max_completion_tokens.clone(),
-        );
-    } else if let Some(max_tokens) = object.get("max_tokens") {
-        responses_body.insert("max_output_tokens".to_owned(), max_tokens.clone());
+    if let Some(v) = object
+        .get("max_completion_tokens")
+        .or_else(|| object.get("max_tokens"))
+    {
+        responses_body.insert("max_output_tokens".to_owned(), v.clone());
     }
 
     prepare_request_body(
@@ -422,6 +420,25 @@ mod tests {
         assert_eq!(prepared.body["input"][0]["role"], "developer");
         assert_eq!(prepared.body["input"][2]["type"], "function_call");
         assert_eq!(prepared.body["input"][3]["type"], "function_call_output");
+    }
+
+    #[test]
+    fn translate_chat_completions_request_remaps_max_completion_tokens() {
+        let models = ModelsConfig::default();
+        let request = json!({
+            "model": "gpt-5.3-codex",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "max_completion_tokens": 512
+        });
+
+        let prepared = translate_chat_completions_request(
+            serde_json::to_vec(&request).expect("request").as_slice(),
+            &models,
+        )
+        .expect("prepared request");
+
+        assert_eq!(prepared.body["max_output_tokens"], 512);
+        assert!(prepared.body.get("max_completion_tokens").is_none());
     }
 
     #[test]

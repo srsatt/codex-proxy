@@ -196,7 +196,7 @@ mod tests {
 
     #[test]
     fn save_and_load_tokens_round_trip() {
-        let temp = tempdir().expect("tempdir");
+        let temp: tempfile::TempDir = tempdir().expect("tempdir");
         let paths = AppPaths::new(temp.path().join("config.toml"), temp.path().join("data"));
         let tokens = TokenStore {
             access_token: "access-token".to_owned(),
