@@ -16,11 +16,11 @@ use axum::{
 };
 use serde_json::{Map, Value, json};
 
-use crate::config::ModelsConfig;
+use crate::config::{ModelsConfig, RequestDefaultsConfig};
 
 use super::forwarding::{
-    ForwardingState, PreparedRequest, error_response, map_upstream_error, prepare_request_body,
-    send_prepared_request,
+    ForwardingState, PreparedRequest, error_response, extract_success_response_json,
+    map_upstream_error, prepare_request_body, send_prepared_request,
 };
 
 /// Handler for `POST /v1/chat/completions`.
@@ -34,11 +34,14 @@ pub async fn forward_chat_completions(
     request_headers: &HeaderMap,
     request_body: Bytes,
 ) -> Response {
-    let prepared_request =
-        match translate_chat_completions_request(&request_body, &state.config.models) {
-            Ok(prepared_request) => prepared_request,
-            Err(error) => return error_response(StatusCode::BAD_REQUEST, error.to_string()),
-        };
+    let prepared_request = match translate_chat_completions_request(
+        &request_body,
+        &state.config.request_defaults,
+        &state.config.models,
+    ) {
+        Ok(prepared_request) => prepared_request,
+        Err(error) => return error_response(StatusCode::BAD_REQUEST, error.to_string()),
+    };
 
     if prepared_request.original_stream {
         return error_response(
@@ -80,6 +83,7 @@ pub async fn forward_chat_completions(
 /// - `stream` is preserved (used to detect and reject streaming requests).
 pub fn translate_chat_completions_request(
     body: &[u8],
+    request_defaults: &RequestDefaultsConfig,
     models: &ModelsConfig,
 ) -> Result<PreparedRequest> {
     let request: Value =
@@ -124,7 +128,8 @@ pub fn translate_chat_completions_request(
     copy_field(object, &mut responses_body, "text");
 
     if let Some(v) = object
-        .get("max_completion_tokens")
+        .get("max_output_tokens")
+        .or_else(|| object.get("max_completion_tokens"))
         .or_else(|| object.get("max_tokens"))
     {
         responses_body.insert("max_output_tokens".to_owned(), v.clone());
@@ -132,17 +137,15 @@ pub fn translate_chat_completions_request(
 
     prepare_request_body(
         serde_json::to_vec(&Value::Object(responses_body))?.as_slice(),
+        request_defaults,
         models,
     )
 }
 
-/// Read the upstream JSON response and convert it to `chat.completion` format.
+/// Read the upstream success response and convert it to `chat.completion`
+/// format.
 async fn adapt_chat_completions_response(response: reqwest::Response) -> Result<Response> {
-    let status = response.status();
-    let response_json: Value = response
-        .json()
-        .await
-        .context("failed to parse responses API JSON for chat completions compatibility")?;
+    let (status, response_json) = extract_success_response_json(response).await?;
     let chat_completion = responses_to_chat_completion(&response_json)?;
 
     axum::http::Response::builder()
@@ -424,6 +427,7 @@ fn copy_field(source: &Map<String, Value>, target: &mut Map<String, Value>, key:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
 
     #[test]
     fn translate_chat_completions_request_converts_messages_to_responses_input() {
@@ -455,6 +459,7 @@ mod tests {
 
         let prepared = translate_chat_completions_request(
             serde_json::to_vec(&request).expect("request").as_slice(),
+            &Config::default().request_defaults,
             &models,
         )
         .expect("prepared request");
@@ -480,12 +485,32 @@ mod tests {
 
         let prepared = translate_chat_completions_request(
             serde_json::to_vec(&request).expect("request").as_slice(),
+            &Config::default().request_defaults,
             &models,
         )
         .expect("prepared request");
 
         assert_eq!(prepared.body["max_output_tokens"], 512);
         assert!(prepared.body.get("max_completion_tokens").is_none());
+    }
+
+    #[test]
+    fn translate_chat_completions_request_preserves_explicit_max_output_tokens() {
+        let models = ModelsConfig::default();
+        let request = json!({
+            "model": "gpt-5.3-codex",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "max_output_tokens": 1024
+        });
+
+        let prepared = translate_chat_completions_request(
+            serde_json::to_vec(&request).expect("request").as_slice(),
+            &Config::default().request_defaults,
+            &models,
+        )
+        .expect("prepared request");
+
+        assert_eq!(prepared.body["max_output_tokens"], 1024);
     }
 
     #[test]

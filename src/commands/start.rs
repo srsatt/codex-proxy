@@ -43,7 +43,7 @@ pub async fn run(paths: AppPaths, args: StartArgs) -> Result<()> {
     match stored_auth_status(tokens.as_ref()) {
         StoredAuthStatus::Missing => {
             warn!(
-                "No OAuth tokens found yet; the skeleton server will still start, but upstream forwarding is not implemented."
+                "No OAuth tokens found yet; the proxy will start, but authenticated upstream forwarding will remain unavailable until `codex-proxy auth` succeeds."
             );
         }
         StoredAuthStatus::Valid => {
@@ -72,7 +72,7 @@ pub async fn run(paths: AppPaths, args: StartArgs) -> Result<()> {
         bind,
         port,
         fake_api_key_present = !fake_api_key.is_empty(),
-        "Starting codex-proxy skeleton server"
+        "Starting codex-proxy server"
     );
 
     serve(

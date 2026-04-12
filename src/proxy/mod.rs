@@ -96,8 +96,15 @@ pub async fn serve(bind: String, port: u16, state: ProxyAppState) -> Result<()> 
     let local_addr = listener.local_addr().context("failed to read local addr")?;
 
     tracing::info!("codex-proxy listening on http://{local_addr}");
+    let app = router(state);
 
-    let app = Router::new()
+    axum::serve(listener, app)
+        .await
+        .context("proxy server exited unexpectedly")
+}
+
+pub fn router(state: ProxyAppState) -> Router {
+    Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .route("/v1/models", get(list_models))
@@ -106,11 +113,7 @@ pub async fn serve(bind: String, port: u16, state: ProxyAppState) -> Result<()> 
         .route("/v1/chat/completions", post(forward_v1_chat_completions))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
-        .with_state(state);
-
-    axum::serve(listener, app)
-        .await
-        .context("proxy server exited unexpectedly")
+        .with_state(state)
 }
 
 async fn healthz(State(state): State<ProxyAppState>) -> Json<Value> {

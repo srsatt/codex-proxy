@@ -10,7 +10,7 @@
 //! | `[server]`          | [`ServerConfig`]            | Bind address and log level        |
 //! | `[auth]`            | [`AuthConfig`]              | OAuth callback settings           |
 //! | `[upstream]`        | [`UpstreamConfig`]          | ChatGPT backend URLs & credentials |
-//! | `[request_defaults]`| [`RequestDefaultsConfig`]   | Default fields injected into every upstream request |
+//! | `[request_defaults]`| [`RequestDefaultsConfig`]   | Default request fields injected upstream |
 //! | `[models]`          | [`ModelsConfig`]            | Advertised model list and aliases |
 
 use std::{collections::BTreeMap, fs, path::Path};
@@ -178,7 +178,8 @@ impl Default for UpstreamConfig {
 
 /// Default fields injected into every outgoing request by the proxy.
 ///
-/// These mirror the options used by the TypeScript reference implementation.
+/// These are generic request-shaping defaults for the client-facing
+/// OpenAI-compatible surface exposed by `codex-proxy`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RequestDefaultsConfig {
@@ -193,13 +194,9 @@ pub struct RequestDefaultsConfig {
     /// Optional default for the `reasoning.summary` field. Omitted when `None`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_summary: Option<String>,
-    /// Optional default for the `text.format.verbosity` field. Omitted when `None`.
+    /// Optional default for the `text.verbosity` field. Omitted when `None`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text_verbosity: Option<String>,
-    /// When `true` (the default), `function_call_output` items whose paired
-    /// `function_call` was removed during `item_reference` filtering are
-    /// preserved. When `false`, they are dropped to avoid upstream API errors.
-    pub preserve_orphaned_function_call_outputs: bool,
 }
 
 impl Default for RequestDefaultsConfig {
@@ -209,7 +206,6 @@ impl Default for RequestDefaultsConfig {
             reasoning_effort: None,
             reasoning_summary: None,
             text_verbosity: None,
-            preserve_orphaned_function_call_outputs: true,
         }
     }
 }
@@ -338,7 +334,6 @@ mod tests {
             config.request_defaults.include,
             vec!["reasoning.encrypted_content".to_owned()]
         );
-        assert!(config.request_defaults.preserve_orphaned_function_call_outputs);
         assert_eq!(
             config.models.advertised,
             vec![

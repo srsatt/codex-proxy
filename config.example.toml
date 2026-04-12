@@ -19,6 +19,9 @@ scope = "openid profile email offline_access"
 originator = "codex_cli_rs"
 beta_header = "responses=experimental"
 
+[request_defaults]
+include = ["reasoning.encrypted_content"]
+
 [models]
 advertised = ["gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex"]
 fallback = "gpt-5.4"

@@ -9,7 +9,7 @@
 //!    - Filter `item_reference` items from the `input` array.
 //!    - Strip `id` fields from remaining `input` items.
 //!    - Drop `function_call_output` items orphaned by reference filtering.
-//!    - Ensure `reasoning.encrypted_content` is in the `include` array.
+//!    - Apply configurable request defaults (`reasoning`, `text`, `include`).
 //! 3. **Forward** the prepared body to the ChatGPT Codex backend via
 //!    [`send_prepared_request`], attaching OAuth headers.
 //! 4. **Handle** the upstream response:
@@ -32,7 +32,7 @@ use url::Url;
 
 use crate::{
     auth::refresh_access_token,
-    config::{Config, ModelsConfig},
+    config::{Config, ModelsConfig, RequestDefaultsConfig},
     paths::AppPaths,
     state::{StoredAuthStatus, TokenStore, save_tokens, stored_auth_status},
 };
@@ -83,8 +83,8 @@ pub struct TransformationSummary {
     /// Number of `function_call_output` items dropped because their paired
     /// `function_call` was removed by reference filtering.
     pub dropped_orphaned_tool_outputs: usize,
-    /// `true` when `reasoning.encrypted_content` was added to `include`.
-    pub include_reasoning_added: bool,
+    /// Number of entries appended to `include` from `request_defaults.include`.
+    pub include_defaults_added: usize,
 }
 
 /// Per-request statistics produced by [`normalize_input`].
@@ -107,7 +107,11 @@ pub async fn forward_responses(
     request_headers: &HeaderMap,
     request_body: Bytes,
 ) -> Response {
-    let prepared_request = match prepare_request_body(&request_body, &state.config.models) {
+    let prepared_request = match prepare_request_body(
+        &request_body,
+        &state.config.request_defaults,
+        &state.config.models,
+    ) {
         Ok(prepared_request) => prepared_request,
         Err(error) => return error_response(StatusCode::BAD_REQUEST, error.to_string()),
     };
@@ -180,7 +184,7 @@ pub async fn send_prepared_request(
         filtered_item_references = transformation.filtered_item_references,
         stripped_item_ids = transformation.stripped_item_ids,
         dropped_orphaned_tool_outputs = transformation.dropped_orphaned_tool_outputs,
-        include_reasoning_added = transformation.include_reasoning_added,
+        include_defaults_added = transformation.include_defaults_added,
         "forwarding request to upstream"
     );
 
@@ -211,8 +215,13 @@ pub async fn send_prepared_request(
 /// - `stream: true` — the upstream always streams; the proxy un-streams when
 ///   the client did not request streaming.
 /// - [`normalize_input`] — filters references and strips item IDs.
-/// - [`normalize_include`] — ensures `reasoning.encrypted_content` is included.
-pub fn prepare_request_body(body: &[u8], models: &ModelsConfig) -> Result<PreparedRequest> {
+/// - [`apply_request_defaults`] — applies configurable `reasoning`, `text`,
+///   and `include` defaults without overwriting explicit client values.
+pub fn prepare_request_body(
+    body: &[u8],
+    request_defaults: &RequestDefaultsConfig,
+    models: &ModelsConfig,
+) -> Result<PreparedRequest> {
     let mut body: Value =
         serde_json::from_slice(body).context("request body must be valid JSON")?;
     let original_stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
@@ -241,7 +250,7 @@ pub fn prepare_request_body(body: &[u8], models: &ModelsConfig) -> Result<Prepar
         .map(normalize_input)
         .unwrap_or_default();
 
-    let include_reasoning_added = normalize_include(object);
+    let include_defaults_added = apply_request_defaults(object, request_defaults);
     let normalized_model = object
         .get("model")
         .and_then(Value::as_str)
@@ -258,7 +267,7 @@ pub fn prepare_request_body(body: &[u8], models: &ModelsConfig) -> Result<Prepar
             filtered_item_references: input_stats.filtered_item_references,
             stripped_item_ids: input_stats.stripped_item_ids,
             dropped_orphaned_tool_outputs: input_stats.dropped_orphaned_tool_outputs,
-            include_reasoning_added,
+            include_defaults_added,
         },
     })
 }
@@ -349,30 +358,110 @@ pub fn normalize_input(input: &mut Value) -> InputNormalizationStats {
     }
 }
 
-/// Ensure `"reasoning.encrypted_content"` is present in the `include` array.
+fn apply_request_defaults(
+    body: &mut serde_json::Map<String, Value>,
+    request_defaults: &RequestDefaultsConfig,
+) -> usize {
+    let has_reasoning_defaults = request_defaults
+        .reasoning_effort
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+        || request_defaults
+            .reasoning_summary
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty());
+
+    if has_reasoning_defaults {
+        if let Some(reasoning) = ensure_object_field(body, "reasoning") {
+            insert_default_string_field(
+                reasoning,
+                "effort",
+                request_defaults.reasoning_effort.as_deref(),
+            );
+            insert_default_string_field(
+                reasoning,
+                "summary",
+                request_defaults.reasoning_summary.as_deref(),
+            );
+        }
+    }
+
+    let has_text_defaults = request_defaults
+        .text_verbosity
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty());
+
+    if has_text_defaults {
+        if let Some(text) = ensure_object_field(body, "text") {
+            insert_default_string_field(
+                text,
+                "verbosity",
+                request_defaults.text_verbosity.as_deref(),
+            );
+        }
+    }
+
+    normalize_include(body, &request_defaults.include)
+}
+
+fn ensure_object_field<'a>(
+    body: &'a mut serde_json::Map<String, Value>,
+    key: &str,
+) -> Option<&'a mut serde_json::Map<String, Value>> {
+    if !body.contains_key(key) {
+        body.insert(key.to_owned(), Value::Object(serde_json::Map::new()));
+    }
+
+    body.get_mut(key)?.as_object_mut()
+}
+
+fn insert_default_string_field(
+    object: &mut serde_json::Map<String, Value>,
+    key: &str,
+    default: Option<&str>,
+) {
+    let Some(default) = default.filter(|value| !value.trim().is_empty()) else {
+        return;
+    };
+
+    if !object.contains_key(key) {
+        object.insert(key.to_owned(), Value::String(default.to_owned()));
+    }
+}
+
+/// Ensure every configured default include entry is present in the `include`
+/// array.
 ///
-/// Returns `true` if the entry had to be added, `false` if it was already
-/// there. The return value is recorded in [`TransformationSummary`] for
-/// logging.
-fn normalize_include(body: &mut serde_json::Map<String, Value>) -> bool {
+/// Returns the number of entries that had to be appended. The return value is
+/// recorded in [`TransformationSummary`] for logging.
+fn normalize_include(
+    body: &mut serde_json::Map<String, Value>,
+    default_include: &[String],
+) -> usize {
     let mut include = body
         .get("include")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let had_reasoning_encrypted = include
-        .iter()
-        .any(|value| value.as_str() == Some("reasoning.encrypted_content"));
+    let mut added = 0;
 
-    if !had_reasoning_encrypted {
-        include.push(Value::String("reasoning.encrypted_content".to_owned()));
+    for value in default_include
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+    {
+        let present = include.iter().any(|entry| entry.as_str() == Some(value));
+        if !present {
+            include.push(Value::String(value.to_owned()));
+            added += 1;
+        }
     }
 
     if !include.is_empty() {
         body.insert("include".to_owned(), Value::Array(include));
     }
 
-    !had_reasoning_encrypted
+    added
 }
 
 /// Build the header map for the upstream ChatGPT Codex request.
@@ -523,7 +612,7 @@ async fn handle_success_response(
         .text()
         .await
         .context("failed to read upstream SSE response")?;
-    let json_response = parse_sse_final_response(&text).unwrap_or(Value::String(text));
+    let json_response = parse_success_text_to_json(&text).unwrap_or(Value::String(text));
 
     Response::builder()
         .status(status)
@@ -621,6 +710,45 @@ pub fn parse_sse_final_response(sse_text: &str) -> Option<Value> {
     None
 }
 
+fn parse_success_text_to_json(body: &str) -> Option<Value> {
+    parse_sse_final_response(body).or_else(|| serde_json::from_str(body).ok())
+}
+
+/// Read a successful upstream response body and extract the final JSON payload.
+///
+/// The ChatGPT Codex backend typically responds as SSE even when the original
+/// client requested non-streaming output. This helper accepts either a plain
+/// JSON body or an SSE stream containing a final `response.done` /
+/// `response.completed` event.
+pub async fn extract_success_response_json(
+    response: reqwest::Response,
+) -> Result<(StatusCode, Value)> {
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    if content_type.contains("application/json") {
+        let json = response
+            .json()
+            .await
+            .context("failed to parse upstream JSON response")?;
+        return Ok((status, json));
+    }
+
+    let body = response
+        .text()
+        .await
+        .context("failed to read upstream success response body")?;
+    let json = parse_success_text_to_json(&body)
+        .ok_or_else(|| anyhow!("upstream success response did not contain a final JSON payload"))?;
+
+    Ok((status, json))
+}
+
 /// Build a JSON error response with a `proxy_error` type envelope.
 pub fn error_response(status: StatusCode, message: impl Into<String>) -> Response {
     let payload = json!({
@@ -644,7 +772,8 @@ mod tests {
         let config = Config::default();
 
         let prepared =
-            prepare_request_body(input.as_bytes(), &config.models).expect("prepared request");
+            prepare_request_body(input.as_bytes(), &config.request_defaults, &config.models)
+                .expect("prepared request");
         let expected_json: Value = serde_json::from_str(expected).expect("expected json");
 
         assert!(!prepared.original_stream);
@@ -659,9 +788,54 @@ mod tests {
                 filtered_item_references: 1,
                 stripped_item_ids: 2,
                 dropped_orphaned_tool_outputs: 0,
-                include_reasoning_added: true,
+                include_defaults_added: 1,
             }
         );
+    }
+
+    #[test]
+    fn prepare_request_body_applies_request_defaults_without_overwriting_explicit_fields() {
+        let mut config = Config::default();
+        config.request_defaults.reasoning_effort = Some("high".to_owned());
+        config.request_defaults.reasoning_summary = Some("auto".to_owned());
+        config.request_defaults.text_verbosity = Some("low".to_owned());
+        config
+            .request_defaults
+            .include
+            .push("message.output_text.logprobs".to_owned());
+
+        let request = json!({
+            "model": "gpt-5.4",
+            "reasoning": {
+                "effort": "medium"
+            },
+            "text": {
+                "verbosity": "high"
+            },
+            "include": ["reasoning.encrypted_content"],
+            "input": [
+                { "type": "message", "role": "user", "content": "hello" }
+            ]
+        });
+
+        let prepared = prepare_request_body(
+            serde_json::to_vec(&request).expect("request").as_slice(),
+            &config.request_defaults,
+            &config.models,
+        )
+        .expect("prepared request");
+
+        assert_eq!(prepared.body["reasoning"]["effort"], "medium");
+        assert_eq!(prepared.body["reasoning"]["summary"], "auto");
+        assert_eq!(prepared.body["text"]["verbosity"], "high");
+        assert_eq!(
+            prepared.body["include"],
+            json!([
+                "reasoning.encrypted_content",
+                "message.output_text.logprobs"
+            ])
+        );
+        assert_eq!(prepared.transformation.include_defaults_added, 1);
     }
 
     #[test]
@@ -719,6 +893,15 @@ data: {\"type\":\"response.done\",\"response\":{\"id\":\"resp_123\",\"object\":\
 
         assert_eq!(parsed["id"], "resp_123");
         assert_eq!(parsed["object"], "response");
+    }
+
+    #[test]
+    fn parse_sse_final_response_extracts_response_completed_payload() {
+        let sse = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_456\"}}\n";
+
+        let parsed = parse_sse_final_response(sse).expect("parsed response");
+
+        assert_eq!(parsed["id"], "resp_456");
     }
 
     #[test]

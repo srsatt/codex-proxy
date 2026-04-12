@@ -26,3 +26,4 @@ anyhow = "1.0.102"
 
 [dev-dependencies]
 tempfile = "3.20.0"
+tower = { version = "0.5.2", features = ["util"] }
