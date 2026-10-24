@@ -860,3 +860,48 @@ async fn browser_cors_and_unknown_models_are_rejected() {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 }
+
+#[tokio::test]
+async fn profiled_reasoning_is_not_stripped_on_upstream_rejection() {
+    let upstream = MockUpstream::spawn(
+        StatusCode::BAD_REQUEST,
+        "application/json",
+        r#"{"detail":"Unsupported parameter: reasoning"}"#,
+        None,
+    )
+    .await;
+    let temp = tempdir().unwrap();
+    let paths = test_paths(&temp);
+    paths.ensure_runtime_layout().unwrap();
+    let mut config = make_config(&upstream);
+    config
+        .models
+        .aliases
+        .insert("ha-profile".into(), "gpt-5.4".into());
+    config
+        .models
+        .reasoning_efforts
+        .insert("ha-profile".into(), "xhigh".into());
+    let app = make_proxy_app(
+        config,
+        paths,
+        "sk-codex-proxy-test",
+        Some(make_token(
+            "account-test",
+            "refresh-test",
+            unix_timestamp_secs() + 3600,
+        )),
+    );
+    let response = app
+        .oneshot(auth_json_request(
+            "/v1/chat/completions",
+            "sk-codex-proxy-test",
+            &json!({"model":"ha-profile","messages":[{"role":"user","content":"fixture"}]}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let recorded = upstream.responses_requests.lock().await;
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0].body["reasoning"]["effort"], "xhigh");
+}

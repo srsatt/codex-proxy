@@ -398,7 +398,14 @@ pub async fn send_prepared_request(
         // If so, strip it and retry rather than surfacing the error to the client.
         if status == StatusCode::BAD_REQUEST && attempt < MAX_STRIP_RETRIES {
             let body_bytes = response.bytes().await.unwrap_or_default();
-            if let Some(param) = extract_unsupported_param(&body_bytes) {
+            let required_effort = prepared_request
+                .transformation
+                .original_model
+                .as_deref()
+                .and_then(|model| state.config.models.required_reasoning_effort(model));
+            if let Some(param) = extract_unsupported_param(&body_bytes)
+                .filter(|param| param != "reasoning" || required_effort.is_none())
+            {
                 tracing::warn!(
                     %request_id,
                     route_kind,
