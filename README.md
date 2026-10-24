@@ -568,3 +568,7 @@ Stop the daemon before `auth` and restart it afterward to prevent two processes
 from refreshing the same account tokens. Do not put callback URLs, API keys or
 OAuth tokens in logs or shell history. State files are credentials, not history;
 this installation deliberately uses reauthentication instead of token backups.
+
+Dependency review: updated compatible locked dependencies on 2026-10-24;
+`cargo audit` reports zero vulnerabilities and zero warnings against RustSec
+database commit `21d909e4c8bd4e14c7aea58bf980c881a0053ab1`.
