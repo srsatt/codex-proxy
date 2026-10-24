@@ -6,6 +6,7 @@
 
 use std::{
     fs,
+    io::Write,
     path::{Path, PathBuf},
 };
 
@@ -36,18 +37,23 @@ pub fn write_json<T>(path: &Path, value: &T) -> Result<()>
 where
     T: Serialize,
 {
-    ensure_parent_dir(path)?;
-    let content = serde_json::to_string_pretty(value)?;
-    fs::write(path, content)?;
-    set_owner_only_permissions(path)?;
-    Ok(())
+    write_string(path, &serde_json::to_string_pretty(value)?)
 }
 
-/// Write a plain string to `path`, creating parent directories as needed.
+/// Replace a state file atomically with an owner-only, durable temporary file.
 pub fn write_string(path: &Path, value: &str) -> Result<()> {
     ensure_parent_dir(path)?;
-    fs::write(path, value)?;
-    set_owner_only_permissions(path)?;
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    set_owner_only_permissions(temporary.path())?;
+    temporary.write_all(value.as_bytes())?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(path)?;
+    #[cfg(unix)]
+    fs::File::open(parent)?.sync_all()?;
     Ok(())
 }
 
@@ -79,4 +85,48 @@ fn set_owner_only_permissions(path: &Path) -> Result<()> {
 #[cfg(not(unix))]
 fn set_owner_only_permissions(_path: &Path) -> Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn atomic_write_replaces_contents_and_keeps_owner_only_permissions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tokens.json");
+        write_json(&path, &vec!["old"]).unwrap();
+        write_json(&path, &vec!["new"]).unwrap();
+        assert_eq!(
+            read_json::<Vec<String>>(&path).unwrap().unwrap(),
+            vec!["new"]
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_does_not_follow_destination_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("other");
+        fs::write(&target, "untouched").unwrap();
+        let path = dir.path().join("tokens.json");
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        write_string(&path, "replacement").unwrap();
+        assert_eq!(fs::read_to_string(target).unwrap(), "untouched");
+        assert!(
+            !fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
 }

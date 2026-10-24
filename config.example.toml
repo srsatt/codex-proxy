@@ -33,6 +33,7 @@ include = ["reasoning.encrypted_content"]
 
 [models]
 advertised = ["gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex"]
+# Legacy compatibility field; unknown models are rejected in this fork.
 fallback = "gpt-5.4"
 
 [models.aliases]

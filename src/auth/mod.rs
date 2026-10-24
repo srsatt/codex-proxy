@@ -160,19 +160,8 @@ async fn request_tokens(
 
     let status = response.status();
     if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        let body = body.trim();
-        warn!(
-            status = %status,
-            body_snippet = %truncate_log_body(body),
-            "OAuth token endpoint returned a non-success response"
-        );
-        let detail = if body.is_empty() {
-            format!("OAuth token request failed with status {status}")
-        } else {
-            format!("OAuth token request failed with status {status}: {body}")
-        };
-        anyhow::bail!(detail);
+        warn!(status = %status, "OAuth token endpoint returned a non-success response");
+        anyhow::bail!("OAuth token request failed with status {status}");
     }
 
     let token_response: OAuthTokenResponse = response
@@ -253,17 +242,6 @@ fn create_code_challenge(pkce_verifier: &str) -> String {
 
 fn default_token_type() -> String {
     "Bearer".to_owned()
-}
-
-fn truncate_log_body(body: &str) -> String {
-    const MAX_CHARS: usize = 256;
-    let compact = body.split_whitespace().collect::<Vec<_>>().join(" ");
-    if compact.chars().count() <= MAX_CHARS {
-        compact
-    } else {
-        let truncated = compact.chars().take(MAX_CHARS).collect::<String>();
-        format!("{truncated}...[truncated]")
-    }
 }
 
 #[cfg(test)]
@@ -380,6 +358,32 @@ mod tests {
         assert_eq!(tokens.scope, "openid profile email offline_access");
         assert!(tokens.expires_at > tokens.obtained_at);
 
+        server.abort();
+    }
+    #[tokio::test]
+    async fn oauth_error_does_not_expose_response_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/oauth/token",
+            post(|| async {
+                (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    "sensitive-refresh-token",
+                )
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let upstream = UpstreamConfig {
+            token_url: format!("http://{addr}/oauth/token"),
+            ..UpstreamConfig::default()
+        };
+        let error = refresh_access_token(&Client::new(), &upstream, "old-token")
+            .await
+            .unwrap_err();
+        assert!(!format!("{error:#}").contains("sensitive-refresh-token"));
         server.abort();
     }
 }

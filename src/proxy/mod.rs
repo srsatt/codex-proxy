@@ -35,7 +35,7 @@ use reqwest::Client;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
-use tower_http::{cors::CorsLayer, trace::TraceLayer};
+use tower_http::trace::TraceLayer;
 
 use crate::{
     config::Config,
@@ -119,7 +119,6 @@ pub fn router(state: ProxyAppState) -> Router {
         )
         .route("/v1/responses/compact", post(forward_v1_responses_compact))
         .route("/v1/chat/completions", post(forward_v1_chat_completions))
-        .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }

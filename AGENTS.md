@@ -194,3 +194,20 @@ For Docker auth changes, verify the image-level config too:
 ```bash
 docker run --rm --entrypoint cat codex-proxy:latest /app/config.toml
 ```
+
+## Personal fork security changes
+
+This fork keeps upstream's runtime paths and JSON schemas. It replaces state files
+atomically with owner-only permissions and fsync, serializes refresh-token use,
+rejects unknown models instead of silently using `models.fallback` (the legacy
+field remains accepted), removes permissive browser CORS, and omits upstream
+headers and response bodies from diagnostics. Keep the API and temporary OAuth
+callback on loopback. Bifrost supplies authenticated access and concurrency limits.
+The non-streaming chat adapter is unchanged; use `/v1/responses` for streaming.
+
+For a remote server, OAuth needs no public route, DNS name, TLS certificate, or
+inbound firewall rule. Use a temporary SSH localhost tunnel or the paste fallback.
+Stop the daemon before `auth` and restart it afterward to prevent two processes
+from refreshing the same account tokens. Do not put callback URLs, API keys or
+OAuth tokens in logs or shell history. State files are credentials, not history;
+this installation deliberately uses reauthentication instead of token backups.

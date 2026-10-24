@@ -756,3 +756,107 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_ws\",\"object
     assert_eq!(recorded[0].body["store"], false);
     assert_eq!(recorded[0].body["stream"], true);
 }
+
+#[tokio::test]
+async fn concurrent_requests_refresh_a_rotating_token_only_once() {
+    let refreshed_access_token = make_access_token("account-new");
+    let upstream = MockUpstream::spawn(
+        StatusCode::OK,
+        "text/event-stream; charset=utf-8",
+        "data: {\"type\":\"response.done\",\"response\":{\"id\":\"resp_refresh\",\"object\":\"response\"}}\n",
+        Some(json!({
+            "access_token": refreshed_access_token,
+            "refresh_token": "refresh-new",
+            "expires_in": 3600,
+            "token_type": "Bearer",
+            "scope": "openid profile email offline_access"
+        })),
+    )
+    .await;
+
+    let temp = tempdir().expect("tempdir");
+    let paths = test_paths(&temp);
+    paths.ensure_runtime_layout().expect("runtime layout");
+    let app = make_proxy_app(
+        make_config(&upstream),
+        paths.clone(),
+        "sk-codex-proxy-test",
+        Some(make_token(
+            "account-old",
+            "refresh-old",
+            unix_timestamp_secs() - 60,
+        )),
+    );
+
+    let mut tasks = tokio::task::JoinSet::new();
+    for _ in 0..10 {
+        let app = app.clone();
+        tasks.spawn(async move {
+            let response = app
+                .oneshot(auth_json_request(
+                    "/v1/responses",
+                    "sk-codex-proxy-test",
+                    &json!({"model": "gpt-5.4", "input": "hello"}),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let _ = read_json(response).await;
+        });
+    }
+    while let Some(result) = tasks.join_next().await {
+        result.unwrap();
+    }
+    assert_eq!(upstream.token_requests.lock().await.len(), 1);
+
+    let recorded = upstream.responses_requests.lock().await;
+    assert_eq!(recorded.len(), 10);
+    assert_eq!(
+        recorded[0].header("authorization"),
+        Some(&format!("Bearer {refreshed_access_token}")[..])
+    );
+    assert_eq!(
+        recorded[0].header("chatgpt-account-id"),
+        Some("account-new")
+    );
+    assert!(recorded[0].header("x-client-request-id").is_some());
+
+    let stored = load_tokens(&paths)
+        .expect("load tokens")
+        .expect("refreshed tokens saved");
+    assert_eq!(stored.refresh_token, "refresh-new");
+    assert_eq!(stored.account_id.as_deref(), Some("account-new"));
+}
+
+#[tokio::test]
+async fn browser_cors_and_unknown_models_are_rejected() {
+    let temp = tempdir().unwrap();
+    let paths = test_paths(&temp);
+    let app = make_proxy_app(Config::default(), paths, "sk-codex-proxy-test", None);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/healthz")
+                .header("Origin", "https://untrusted.example")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        !response
+            .headers()
+            .contains_key("access-control-allow-origin")
+    );
+    for path in [
+        "/v1/responses",
+        "/v1/responses/compact",
+        "/v1/chat/completions",
+    ] {
+        let response = app.clone().oneshot(auth_json_request(path, "sk-codex-proxy-test",
+            &json!({"model": "unknown-model", "input": "hello", "messages": [{"role":"user","content":"hello"}]}),
+        )).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+}

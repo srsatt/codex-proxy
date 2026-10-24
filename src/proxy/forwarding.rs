@@ -45,7 +45,6 @@ const PROXY_UPSTREAM_REQUEST_ID_HEADER: &str = "x-codex-proxy-upstream-request-i
 // TODO: update once the real header is confirmed from debug logs — the ChatGPT backend
 // may not return `x-request-id` at all, in which case "missing" in logs is expected.
 const UPSTREAM_REQUEST_ID_HEADER: &str = "x-request-id";
-const MAX_ERROR_BODY_SNIPPET_CHARS: usize = 512;
 
 /// State shared between the proxy router and the forwarding layer.
 ///
@@ -392,21 +391,6 @@ pub async fn send_prepared_request(
         let status = response.status();
         let upstream_request_id = upstream_request_id_from_headers(response.headers());
 
-        // Dump all upstream response headers at DEBUG level so operators can
-        // discover the real correlation header name if "missing" appears in logs.
-        // TODO: update UPSTREAM_REQUEST_ID_HEADER once real header confirmed from debug logs.
-        if tracing::enabled!(tracing::Level::DEBUG) {
-            for (name, value) in response.headers() {
-                tracing::debug!(
-                    %request_id,
-                    route_kind,
-                    header_name = %name,
-                    header_value = value.to_str().unwrap_or("<non-utf8>"),
-                    "upstream response header"
-                );
-            }
-        }
-
         let upstream_headers = response.headers().clone();
         let latency_ms = request_start.elapsed().as_millis();
 
@@ -512,6 +496,7 @@ pub fn prepare_request_body(
         .get("model")
         .and_then(Value::as_str)
         .map(|model| models.canonicalize(model))
+        .transpose()?
     {
         object.insert("model".to_owned(), Value::String(normalized_model));
     }
@@ -582,6 +567,7 @@ pub fn prepare_compact_request_body(body: &[u8], models: &ModelsConfig) -> Resul
         .get("model")
         .and_then(Value::as_str)
         .map(|model| models.canonicalize(model))
+        .transpose()?
     {
         object.insert("model".to_owned(), Value::String(normalized_model));
     }
@@ -892,26 +878,18 @@ pub fn build_upstream_headers(
 /// the in-memory `Arc<RwLock<...>>` is updated so subsequent requests in the
 /// same daemon session do not trigger unnecessary refreshes.
 async fn get_or_refresh_tokens(state: &ForwardingState) -> Result<TokenStore> {
-    let current = state.tokens.read().await.clone();
+    // Hold the write lock through refresh and persistence to avoid refresh-token reuse.
+    let mut guard = state.tokens.write().await;
+    if guard.is_none() {
+        *guard =
+            crate::state::load_tokens(&state.paths).context("failed to read tokens from disk")?;
+    }
+    let current = guard.clone();
     let status = stored_auth_status(current.as_ref());
 
     match status {
         StoredAuthStatus::Missing => {
-            // The server may have started before `codex-proxy auth` completed.
-            // Try loading tokens from disk before giving up.
-            let loaded = crate::state::load_tokens(&state.paths)
-                .context("failed to read tokens from disk")?;
-            match loaded {
-                None => bail!("no stored OAuth tokens are available; run `codex-proxy auth`"),
-                Some(tokens) => {
-                    tracing::info!(
-                        account_id = tokens.account_id.as_deref().unwrap_or("missing"),
-                        "loaded OAuth tokens from disk (auth completed after startup)"
-                    );
-                    *state.tokens.write().await = Some(tokens.clone());
-                    return Ok(tokens);
-                }
-            }
+            bail!("no stored OAuth tokens are available; run `codex-proxy auth`");
         }
         StoredAuthStatus::Valid => {
             return current.ok_or_else(|| anyhow!("stored OAuth tokens disappeared"));
@@ -932,10 +910,8 @@ async fn get_or_refresh_tokens(state: &ForwardingState) -> Result<TokenStore> {
     .await
     .context("failed to refresh stored OAuth tokens")?;
 
-    save_tokens(&state.paths, &refreshed_tokens).context("failed to persist refreshed tokens")?;
-
-    let mut guard = state.tokens.write().await;
     *guard = Some(refreshed_tokens.clone());
+    save_tokens(&state.paths, &refreshed_tokens).context("failed to persist refreshed tokens")?;
     tracing::info!(
         account_id = refreshed_tokens.account_id.as_deref().unwrap_or("missing"),
         "refreshed stored OAuth tokens during request forwarding"
@@ -1108,7 +1084,6 @@ async fn handle_success_response(
                                     upstream_request_id = upstream_request_id_clone
                                         .as_deref()
                                         .unwrap_or("missing"),
-                                    body_summary = %redact_sensitive_text(&text),
                                     "successful upstream response did not contain a parseable \
                                      final JSON payload; returning raw text envelope"
                                 );
@@ -1155,7 +1130,6 @@ async fn handle_success_response(
                         upstream_request_id = upstream_request_id_clone
                             .as_deref()
                             .unwrap_or("missing"),
-                        body_summary = %redact_sensitive_text(&text),
                         "successful upstream response did not contain a parseable \
                          final JSON payload; returning raw text envelope"
                     );
@@ -1200,14 +1174,6 @@ pub async fn map_upstream_error(upstream: UpstreamExchange) -> Response {
         UpstreamExchangeBody::Live(response) => response.bytes().await.unwrap_or_default(),
     };
 
-    tracing::debug!(
-        %request_id,
-        upstream_request_id = upstream_request_id.as_deref().unwrap_or("missing"),
-        status = %original_status,
-        raw_body = %String::from_utf8_lossy(&body),
-        "upstream error response raw body"
-    );
-
     let usage_limit_response = if status == StatusCode::NOT_FOUND {
         std::str::from_utf8(&body)
             .ok()
@@ -1232,7 +1198,6 @@ pub async fn map_upstream_error(upstream: UpstreamExchange) -> Response {
         upstream_request_id = upstream_request_id.as_deref().unwrap_or("missing"),
         status = %original_status,
         mapped_status = %status,
-        body_summary = %summarize_error_body(&body),
         "upstream returned error response"
     );
 
@@ -1336,81 +1301,6 @@ fn extract_unsupported_param(body: &[u8]) -> Option<String> {
     }
 
     None
-}
-
-fn summarize_error_body(body: &[u8]) -> String {
-    let text = String::from_utf8_lossy(body);
-    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
-
-    if let Ok(value) = serde_json::from_str::<Value>(&compact) {
-        let error = value.get("error").unwrap_or(&value);
-        let error_type = error.get("type").and_then(Value::as_str);
-        let error_code = error.get("code").and_then(Value::as_str);
-        let error_param = error.get("param").and_then(Value::as_str);
-        let message = error.get("message").and_then(Value::as_str);
-
-        // If the body matches the OpenAI error shape, format it concisely.
-        if error_type.is_some() || message.is_some() {
-            let message_str = message
-                .map(redact_sensitive_text)
-                .unwrap_or_else(|| "missing".to_owned());
-            return format!(
-                "json_error[type={}, code={}, param={}, message={message_str}]",
-                error_type.unwrap_or("unknown"),
-                error_code.unwrap_or("unknown"),
-                error_param.unwrap_or("unknown"),
-            );
-        }
-
-        // Non-standard JSON error — log the raw body so the content isn't lost.
-        return redact_sensitive_text(&compact);
-    }
-
-    redact_sensitive_text(&compact)
-}
-
-fn redact_sensitive_text(text: &str) -> String {
-    let mut redacted = text.to_owned();
-    for marker in ["Bearer ", "bearer ", "sk-", "eyJ"] {
-        redacted = redact_after_marker(&redacted, marker);
-    }
-
-    if redacted.chars().count() <= MAX_ERROR_BODY_SNIPPET_CHARS {
-        redacted
-    } else {
-        let truncated = redacted
-            .chars()
-            .take(MAX_ERROR_BODY_SNIPPET_CHARS)
-            .collect::<String>();
-        format!("{truncated}...[truncated]")
-    }
-}
-
-fn redact_after_marker(text: &str, marker: &str) -> String {
-    let mut output = String::with_capacity(text.len());
-    let mut remaining = text;
-
-    while let Some(index) = remaining.find(marker) {
-        let (before, after_marker) = remaining.split_at(index);
-        output.push_str(before);
-        output.push_str(marker);
-
-        let secret = after_marker[marker.len()..]
-            .chars()
-            .take_while(|c| !c.is_whitespace() && *c != '"' && *c != '\'' && *c != ',' && *c != '}')
-            .collect::<String>();
-
-        if secret.is_empty() {
-            remaining = &after_marker[marker.len()..];
-            continue;
-        }
-
-        output.push_str("[redacted]");
-        remaining = &after_marker[marker.len() + secret.len()..];
-    }
-
-    output.push_str(remaining);
-    output
 }
 
 /// Scan an SSE text body for the final response object.

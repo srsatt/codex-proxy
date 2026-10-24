@@ -279,8 +279,7 @@ impl Default for RequestDefaultsConfig {
 /// 2. **Aliases map** — maps alternative names (e.g. `openai/gpt-5.4`) to
 ///    canonical upstream names.
 ///
-/// If neither lookup matches, the request is forwarded with the `fallback`
-/// model name.
+/// If neither lookup matches, the request is rejected; models are never silently substituted.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ModelsConfig {
@@ -289,8 +288,7 @@ pub struct ModelsConfig {
     /// Map of alternative / prefixed names to their canonical upstream names.
     /// Keys are case-insensitive during lookup.
     pub aliases: BTreeMap<String, String>,
-    /// Model name used when no advertised entry or alias matches the client's
-    /// request. Default: `"gpt-5.4"`.
+    /// Legacy configuration field retained for compatibility; unknown models are rejected.
     pub fallback: String,
 }
 
@@ -303,25 +301,25 @@ impl ModelsConfig {
     ///    step 1.
     /// 3. Exact (case-insensitive) match in `aliases`.
     /// 4. Strip provider prefix and retry step 3.
-    /// 5. Return `fallback`.
-    pub fn canonicalize(&self, model: &str) -> String {
+    /// 5. Reject an unknown model.
+    pub fn canonicalize(&self, model: &str) -> Result<String> {
         let trimmed = model.trim();
         let stripped = trimmed.rsplit('/').next().unwrap_or(trimmed).trim();
 
         if let Some(advertised) = self.find_advertised(trimmed) {
-            return advertised.to_owned();
+            return Ok(advertised.to_owned());
         }
         if let Some(advertised) = self.find_advertised(stripped) {
-            return advertised.to_owned();
+            return Ok(advertised.to_owned());
         }
         if let Some(alias) = self.find_alias(trimmed) {
-            return alias.to_owned();
+            return Ok(alias.to_owned());
         }
         if let Some(alias) = self.find_alias(stripped) {
-            return alias.to_owned();
+            return Ok(alias.to_owned());
         }
 
-        self.fallback.clone()
+        anyhow::bail!("model `{model}` is not configured for codex-proxy")
     }
 
     /// Returns `true` if `model` is in the `advertised` list (case-insensitive).
@@ -446,9 +444,12 @@ callback_port = 1455
     fn models_config_canonicalize_uses_advertised_and_alias_entries() {
         let config = ModelsConfig::default();
 
-        assert_eq!(config.canonicalize("gpt-5.4"), "gpt-5.4");
-        assert_eq!(config.canonicalize("openai/gpt-5.4-mini"), "gpt-5.4-mini");
-        assert_eq!(config.canonicalize("gpt-5-codex"), "gpt-5.3-codex");
-        assert_eq!(config.canonicalize("unknown-model"), "gpt-5.4");
+        assert_eq!(config.canonicalize("gpt-5.4").unwrap(), "gpt-5.4");
+        assert_eq!(
+            config.canonicalize("openai/gpt-5.4-mini").unwrap(),
+            "gpt-5.4-mini"
+        );
+        assert_eq!(config.canonicalize("gpt-5-codex").unwrap(), "gpt-5.3-codex");
+        assert!(config.canonicalize("unknown-model").is_err());
     }
 }
