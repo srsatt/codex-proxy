@@ -110,8 +110,8 @@ pub async fn forward_chat_completions(
 /// Field mappings:
 /// - `messages` → `input` (via [`convert_chat_messages`])
 /// - `max_completion_tokens` or `max_tokens` → `max_output_tokens`
-/// - `tools`, `tool_choice`, `reasoning`, `include`, `prompt_cache_key`,
-///   `text` are copied verbatim.
+/// - Function `tools` and forced `tool_choice` are flattened for Responses.
+/// - `reasoning`, `include`, `prompt_cache_key`, `text` are copied verbatim.
 /// - `stream` is preserved (used to detect and reject streaming requests).
 pub fn translate_chat_completions_request(
     body: &[u8],
@@ -159,8 +159,31 @@ pub fn translate_chat_completions_request(
         Value::Array(convert_chat_messages(messages)?),
     );
 
-    copy_field(object, &mut responses_body, "tools");
-    copy_field(object, &mut responses_body, "tool_choice");
+    if let Some(tools) = object.get("tools").filter(|v| !v.is_null()) {
+        let tools = tools
+            .as_array()
+            .ok_or_else(|| anyhow!("`tools` must be an array"))?;
+        let tools = tools
+            .iter()
+            .map(|tool| {
+                let function = chat_function(tool)?;
+                let mut flat = function.clone();
+                flat.insert("type".to_owned(), json!("function"));
+                // Chat defaults to non-strict schemas; Responses defaults to strict.
+                flat.entry("strict").or_insert(json!(false));
+                Ok(Value::Object(flat))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        responses_body.insert("tools".to_owned(), Value::Array(tools));
+    }
+    if let Some(choice) = object.get("tool_choice").filter(|v| !v.is_null()) {
+        let choice = match choice.as_str() {
+            Some("auto" | "none" | "required") => choice.clone(),
+            Some(_) => bail!("unsupported `tool_choice`"),
+            None => json!({"type": "function", "name": chat_function(choice)?["name"]}),
+        };
+        responses_body.insert("tool_choice".to_owned(), choice);
+    }
     copy_field(object, &mut responses_body, "reasoning");
     copy_field(object, &mut responses_body, "include");
     copy_field(object, &mut responses_body, "prompt_cache_key");
@@ -505,6 +528,28 @@ fn extract_optional_message_content(content: Option<&Value>) -> Result<Option<St
     }
 }
 
+/// Validate the nested Chat Completions function shape before flattening it.
+fn chat_function(value: &Value) -> Result<&Map<String, Value>> {
+    if value.get("type").and_then(Value::as_str) != Some("function") {
+        bail!("only Chat Completions function tools are supported");
+    }
+    let function = value
+        .get("function")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow!("function tool is missing `function`"))?;
+    if function
+        .get("name")
+        .and_then(Value::as_str)
+        .is_none_or(str::is_empty)
+        || function.get("description").is_some_and(|v| !v.is_string())
+        || function.get("parameters").is_some_and(|v| !v.is_object())
+        || function.get("strict").is_some_and(|v| !v.is_boolean())
+    {
+        bail!("invalid Chat Completions function definition");
+    }
+    Ok(function)
+}
+
 /// Copy a field from `source` to `target` if it exists.
 fn copy_field(source: &Map<String, Value>, target: &mut Map<String, Value>, key: &str) {
     if let Some(value) = source.get(key) {
@@ -560,6 +605,64 @@ mod tests {
         assert_eq!(prepared.body["input"][0]["role"], "developer");
         assert_eq!(prepared.body["input"][2]["type"], "function_call");
         assert_eq!(prepared.body["input"][3]["type"], "function_call_output");
+    }
+
+    #[test]
+    fn translate_home_assistant_tools_and_forced_choice() {
+        let mut request = json!({
+            "model": "gpt-5.4",
+            "messages": [{"role": "user", "content": "Turn on a light."}],
+            "tools": [{"type": "function", "function": {
+                "name": "execute_services", "description": "Execute Home Assistant services.",
+                "parameters": {"type": "object", "properties": {
+                    "list": {"type": "array", "items": {"type": "object", "properties": {
+                        "domain": {"type": "string"}, "service": {"type": "string"},
+                        "service_data": {"type": "object"}
+                    }, "required": ["domain", "service", "service_data"]}}
+                }, "required": ["list"]}
+            }}],
+            "tool_choice": {"type": "function", "function": {"name": "execute_services"}}
+        });
+        let translate = |request: &Value| {
+            translate_chat_completions_request(
+                &serde_json::to_vec(request).unwrap(),
+                &RequestDefaultsConfig::default(),
+                &ModelsConfig::default(),
+            )
+        };
+        let prepared = translate(&request).unwrap();
+        assert_eq!(prepared.body["tools"][0]["name"], "execute_services");
+        assert_eq!(
+            prepared.body["tools"][0]["parameters"],
+            request["tools"][0]["function"]["parameters"]
+        );
+        assert_eq!(prepared.body["tools"][0]["strict"], false);
+        assert!(prepared.body["tools"][0].get("function").is_none());
+        assert_eq!(
+            prepared.body["tool_choice"],
+            json!({"type": "function", "name": "execute_services"})
+        );
+        for choice in ["auto", "none", "required"] {
+            request["tool_choice"] = json!(choice);
+            assert_eq!(translate(&request).unwrap().body["tool_choice"], choice);
+        }
+        request["tools"][0]["function"]["strict"] = json!(true);
+        assert_eq!(
+            translate(&request).unwrap().body["tools"][0]["strict"],
+            true
+        );
+        for tool in [
+            json!({"type":"web_search"}),
+            json!({"type":"function"}),
+            json!({"type":"function","function":{"name":""}}),
+            json!({"type":"function","function":{"name":"x","parameters":[]}}),
+        ] {
+            request["tools"] = json!([tool]);
+            assert!(translate(&request).is_err());
+        }
+        request["tools"] = json!([]);
+        request["tool_choice"] = json!({"type":"function","function":{}});
+        assert!(translate(&request).is_err());
     }
 
     #[test]

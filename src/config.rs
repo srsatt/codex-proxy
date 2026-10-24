@@ -288,6 +288,8 @@ pub struct ModelsConfig {
     /// Map of alternative / prefixed names to their canonical upstream names.
     /// Keys are case-insensitive during lookup.
     pub aliases: BTreeMap<String, String>,
+    /// Required reasoning effort for a requested model alias; other models are unchanged.
+    pub reasoning_efforts: BTreeMap<String, String>,
     /// Legacy configuration field retained for compatibility; unknown models are rejected.
     pub fallback: String,
 }
@@ -330,6 +332,17 @@ impl ModelsConfig {
         self.find_advertised(model).is_some()
     }
 
+    pub fn required_reasoning_effort(&self, model: &str) -> Option<&str> {
+        let trimmed = model.trim();
+        let stripped = trimmed.rsplit('/').next().unwrap_or(trimmed).trim();
+        self.reasoning_efforts
+            .iter()
+            .find(|(alias, _)| {
+                alias.eq_ignore_ascii_case(trimmed) || alias.eq_ignore_ascii_case(stripped)
+            })
+            .map(|(_, effort)| effort.as_str())
+    }
+
     fn find_advertised(&self, candidate: &str) -> Option<&str> {
         self.advertised
             .iter()
@@ -364,6 +377,7 @@ impl Default for ModelsConfig {
                 "gpt-5.3-codex".to_owned(),
             ],
             aliases,
+            reasoning_efforts: BTreeMap::new(),
             fallback: "gpt-5.4".to_owned(),
         }
     }

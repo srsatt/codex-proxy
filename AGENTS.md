@@ -104,7 +104,14 @@ Every responses request forwarded upstream is normalized before forwarding:
 `POST /v1/chat/completions` is translated into the responses format by
 `translate_chat_completions_request`, forwarded via the same normalization
 pipeline, then the response is converted back by `responses_to_chat_completion`.
-Streaming is not yet supported on this route.
+Function tools and forced function choices are flattened to the Responses schema;
+Chat schemas remain non-strict unless explicitly enabled. Streaming is not yet
+supported on this route.
+
+An optional `[models.reasoning_efforts]` map binds requested aliases to a required
+reasoning effort. Conflicting client efforts fail closed; canonical model requests
+retain their existing defaults. Compaction rejects profiled aliases because it
+cannot enforce reasoning effort.
 
 ### WebSocket Transport
 `GET /v1/responses` upgrades to a WebSocket for Codex-style clients. Incoming
@@ -203,7 +210,7 @@ rejects unknown models instead of silently using `models.fallback` (the legacy
 field remains accepted), removes permissive browser CORS, and omits upstream
 headers and response bodies from diagnostics. Keep the API and temporary OAuth
 callback on loopback. Bifrost supplies authenticated access and concurrency limits.
-The non-streaming chat adapter is unchanged; use `/v1/responses` for streaming.
+The chat adapter translates function tools; use `/v1/responses` for streaming.
 
 For a remote server, OAuth needs no public route, DNS name, TLS certificate, or
 inbound firewall rule. Use a temporary SSH localhost tunnel or the paste fallback.

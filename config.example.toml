@@ -1,3 +1,4 @@
+# Chat function tools need no configuration; strict schemas are opt-in.
 [server]
 bind = "127.0.0.1"
 port = 8317
@@ -42,3 +43,7 @@ fallback = "gpt-5.4"
 "openai/gpt-5.3-codex" = "gpt-5.3-codex"
 "openai/gpt-5-codex" = "gpt-5.3-codex"
 "gpt-5-codex" = "gpt-5.3-codex"
+
+# Optional alias profile, independent of global request defaults:
+# [models.reasoning_efforts]
+# "gpt-5-codex" = "xhigh"

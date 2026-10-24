@@ -319,6 +319,10 @@ response = client.chat.completions.create(
 print(response.choices[0].message.content)
 ```
 
+Chat Completions function tools and forced function choices are translated to the
+Responses schema. Function schemas stay non-strict unless `strict: true` is set;
+unsupported tool types are rejected.
+
 ### Example — curl
 
 ```bash
@@ -572,3 +576,9 @@ this installation deliberately uses reauthentication instead of token backups.
 Dependency review: updated compatible locked dependencies on 2026-10-24;
 `cargo audit` reports zero vulnerabilities and zero warnings against RustSec
 database commit `21d909e4c8bd4e14c7aea58bf980c881a0053ab1`.
+
+Model aliases may require a reasoning effort through `[models.reasoning_efforts]`.
+Keys use the same case-insensitive, provider-prefix lookup as model aliases.
+The required effort is injected when absent; conflicting requests return HTTP 400.
+Requests for the canonical model keep their own reasoning settings.
+Profiled aliases are rejected by compaction, which cannot enforce reasoning effort.

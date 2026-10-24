@@ -501,6 +501,23 @@ pub fn prepare_request_body(
         object.insert("model".to_owned(), Value::String(normalized_model));
     }
 
+    if let Some(required) = original_model
+        .as_deref()
+        .and_then(|model| models.required_reasoning_effort(model))
+    {
+        let reasoning = object.entry("reasoning").or_insert_with(|| json!({}));
+        let reasoning = reasoning
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("profiled model requires a reasoning object"))?;
+        if reasoning
+            .get("effort")
+            .is_some_and(|effort| effort.as_str() != Some(required))
+        {
+            bail!("requested reasoning effort conflicts with the model profile");
+        }
+        reasoning.insert("effort".to_owned(), json!(required));
+    }
+
     object.insert("store".to_owned(), Value::Bool(false));
     object.insert("stream".to_owned(), Value::Bool(true));
     // Fields sent by some clients that the upstream rejects.
@@ -558,6 +575,14 @@ pub fn prepare_compact_request_body(body: &[u8], models: &ModelsConfig) -> Resul
         .get("model")
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
+
+    if original_model
+        .as_deref()
+        .and_then(|model| models.required_reasoning_effort(model))
+        .is_some()
+    {
+        bail!("reasoning-profiled models are not supported by compaction");
+    }
 
     let object = body
         .as_object_mut()
@@ -1420,6 +1445,75 @@ mod tests {
                 include_defaults_added: 1,
             }
         );
+    }
+
+    #[test]
+    fn alias_reasoning_profile_is_enforced_without_changing_base_model() {
+        let mut config = Config::default();
+        config
+            .models
+            .aliases
+            .insert("gpt-6-luna-xhigh".into(), "gpt-6-luna".into());
+        config.models.advertised = vec!["gpt-6-luna".into()];
+        config
+            .models
+            .reasoning_efforts
+            .insert("gpt-6-luna-xhigh".into(), "xhigh".into());
+        assert!(
+            prepare_compact_request_body(
+                br#"{"model":"gpt-6-luna-xhigh","input":[]}"#,
+                &config.models
+            )
+            .is_err()
+        );
+        for alias in ["gpt-6-luna-xhigh", "codex-proxy/GPT-6-LUNA-XHIGH"] {
+            let request = json!({"model":alias,"input":[]});
+            let prepared = prepare_request_body(
+                &serde_json::to_vec(&request).unwrap(),
+                &config.request_defaults,
+                &config.models,
+            )
+            .unwrap();
+            assert_eq!(prepared.body["model"], "gpt-6-luna");
+            assert_eq!(prepared.body["reasoning"]["effort"], "xhigh");
+        }
+        let request = json!({"model":"gpt-6-luna","input":[]});
+        let prepared = prepare_request_body(
+            &serde_json::to_vec(&request).unwrap(),
+            &config.request_defaults,
+            &config.models,
+        )
+        .unwrap();
+        assert!(
+            prepared
+                .body
+                .get("reasoning")
+                .and_then(|r| r.get("effort"))
+                .is_none()
+        );
+        for reasoning in [
+            json!({"effort":"low"}),
+            json!({"effort":null}),
+            json!("xhigh"),
+        ] {
+            let request = json!({"model":"gpt-6-luna-xhigh","input":[],"reasoning":reasoning});
+            assert!(
+                prepare_request_body(
+                    &serde_json::to_vec(&request).unwrap(),
+                    &config.request_defaults,
+                    &config.models
+                )
+                .is_err()
+            );
+        }
+        let request = json!({"model":"gpt-6-luna-xhigh","input":[],"reasoning":{"effort":"xhigh","summary":"auto"}});
+        let prepared = prepare_request_body(
+            &serde_json::to_vec(&request).unwrap(),
+            &config.request_defaults,
+            &config.models,
+        )
+        .unwrap();
+        assert_eq!(prepared.body["reasoning"]["summary"], "auto");
     }
 
     #[test]
