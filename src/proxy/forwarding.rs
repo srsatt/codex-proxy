@@ -209,19 +209,18 @@ pub async fn forward_responses_compact(
     let request_id = uuid::Uuid::new_v4().to_string();
 
     // Compact does not support streaming — reject early before parsing.
-    if let Ok(body_json) = serde_json::from_slice::<Value>(&request_body) {
-        if body_json
+    if let Ok(body_json) = serde_json::from_slice::<Value>(&request_body)
+        && body_json
             .get("stream")
             .and_then(Value::as_bool)
             .unwrap_or(false)
-        {
-            tracing::warn!(%request_id, route_kind = "compact", "client sent stream: true to compact endpoint");
-            return error_response_with_request_id(
-                StatusCode::BAD_REQUEST,
-                "streaming is not supported for compact responses",
-                &request_id,
-            );
-        }
+    {
+        tracing::warn!(%request_id, route_kind = "compact", "client sent stream: true to compact endpoint");
+        return error_response_with_request_id(
+            StatusCode::BAD_REQUEST,
+            "streaming is not supported for compact responses",
+            &request_id,
+        );
     }
 
     let prepared_request = match prepare_compact_request_body(&request_body, &state.config.models) {
@@ -1315,10 +1314,10 @@ fn extract_unsupported_param(body: &[u8]) -> Option<String> {
     };
 
     // Shape 1: {"detail": "Unsupported parameter: X"}
-    if let Some(detail) = value.get("detail").and_then(Value::as_str) {
-        if let Some(param) = try_extract(detail) {
-            return Some(param);
-        }
+    if let Some(detail) = value.get("detail").and_then(Value::as_str)
+        && let Some(param) = try_extract(detail)
+    {
+        return Some(param);
     }
 
     // Shape 2: {"error": {"message": "Unsupported parameter: X", ...}}
@@ -1326,10 +1325,9 @@ fn extract_unsupported_param(body: &[u8]) -> Option<String> {
         .get("error")
         .and_then(|e| e.get("message"))
         .and_then(Value::as_str)
+        && let Some(param) = try_extract(message)
     {
-        if let Some(param) = try_extract(message) {
-            return Some(param);
-        }
+        return Some(param);
     }
 
     None

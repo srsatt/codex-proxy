@@ -11,12 +11,13 @@
 //! | GET    | `/v1/responses`           | WebSocket compatibility transport for responses      |
 //! | POST   | `/v1/responses`           | Forwards requests to the ChatGPT Codex backend       |
 //! | POST   | `/v1/responses/compact`   | Forwards compaction requests to the Codex backend    |
-//! | POST   | `/v1/chat/completions`    | Non-streaming chat completions compatibility adapter |
+//! | POST   | `/v1/chat/completions`    | Chat completions compatibility adapter |
 //!
 //! All routes except `/healthz` and `/readyz` require the fake API key in
 //! either `Authorization: Bearer <key>` or `x-api-key: <key>`.
 
 mod chat_completions;
+mod chat_stream;
 mod forwarding;
 mod websocket;
 
@@ -178,7 +179,7 @@ fn health_payload(
         "responses_route_ready": responses_route_ready,
         "chat_completions_compatibility": {
             "implemented": true,
-            "streaming_supported": false
+            "streaming_supported": true
         },
         "authenticated": auth_ready,
         "token_status": token_status.as_str(),
@@ -397,7 +398,7 @@ mod tests {
         );
         assert_eq!(
             payload["chat_completions_compatibility"]["streaming_supported"],
-            false
+            true
         );
     }
 

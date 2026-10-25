@@ -5,8 +5,7 @@
 //! the responses-format reply back into an OpenAI-compatible
 //! `chat.completion` object.
 //!
-//! **Limitations**: streaming is not supported. Requests with `stream: true`
-//! receive a 501 Not Implemented. Use `POST /v1/responses` for streaming.
+//! Streaming replies are translated incrementally into Chat Completion chunks.
 
 use anyhow::{Context, Result, anyhow, bail};
 use axum::{
@@ -27,7 +26,7 @@ use super::forwarding::{
 /// Handler for `POST /v1/chat/completions`.
 ///
 /// 1. Translates the chat-completions request body to the responses format.
-/// 2. Rejects streaming requests with 501.
+/// 2. Preserves the requested response mode.
 /// 3. Forwards via [`send_prepared_request`].
 /// 4. Converts the upstream response to a `chat.completion` object.
 pub async fn forward_chat_completions(
@@ -51,15 +50,6 @@ pub async fn forward_chat_completions(
             );
         }
     };
-
-    if prepared_request.original_stream {
-        tracing::warn!(%request_id, route_kind = "chat_completions", "streaming chat completions compatibility request is not supported");
-        return error_response_with_request_id(
-            StatusCode::NOT_IMPLEMENTED,
-            "streaming `/v1/chat/completions` compatibility is not implemented yet; use `/v1/responses` for streaming requests",
-            &request_id,
-        );
-    }
 
     let upstream_url = match upstream_responses_url(&state.config) {
         Ok(url) => url,
@@ -96,6 +86,21 @@ pub async fn forward_chat_completions(
         return map_upstream_error(upstream).await;
     }
 
+    if prepared_request.original_stream {
+        let include_usage = serde_json::from_slice::<Value>(&request_body)
+            .ok()
+            .and_then(|v| {
+                v.pointer("/stream_options/include_usage")
+                    .and_then(Value::as_bool)
+            })
+            .unwrap_or(false);
+        return super::chat_stream::response(
+            upstream,
+            include_usage,
+            state.config.upstream.keep_alive_interval_secs.unwrap_or(15),
+        );
+    }
+
     match adapt_chat_completions_response(upstream).await {
         Ok(response) => response,
         Err(error) => {
@@ -112,7 +117,7 @@ pub async fn forward_chat_completions(
 /// - `max_completion_tokens` or `max_tokens` → `max_output_tokens`
 /// - Function `tools` and forced `tool_choice` are flattened for Responses.
 /// - `reasoning`, `include`, `prompt_cache_key`, `text` are copied verbatim.
-/// - `stream` is preserved (used to detect and reject streaming requests).
+/// - `stream` selects the incremental or buffered response adapter.
 pub fn translate_chat_completions_request(
     body: &[u8],
     request_defaults: &RequestDefaultsConfig,
@@ -193,10 +198,10 @@ pub fn translate_chat_completions_request(
     // string (e.g. `"reasoning_effort": "high"`). The Responses API expects it
     // nested as `reasoning.effort`. Translate only when no `reasoning` object
     // was already copied above.
-    if !responses_body.contains_key("reasoning") {
-        if let Some(effort) = object.get("reasoning_effort").and_then(Value::as_str) {
-            responses_body.insert("reasoning".to_owned(), json!({"effort": effort}));
-        }
+    if !responses_body.contains_key("reasoning")
+        && let Some(effort) = object.get("reasoning_effort").and_then(Value::as_str)
+    {
+        responses_body.insert("reasoning".to_owned(), json!({"effort": effort}));
     }
 
     if let Some(v) = object

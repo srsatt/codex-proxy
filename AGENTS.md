@@ -140,7 +140,7 @@ sends leading JSON whitespace keep-alives while waiting, then
 | GET | `/v1/responses` | Yes | WebSocket compatibility transport |
 | POST | `/v1/responses` | Yes | Primary forwarding route |
 | POST | `/v1/responses/compact` | Yes | Compact response forwarding route |
-| POST | `/v1/chat/completions` | Yes | Non-streaming compat adapter |
+| POST | `/v1/chat/completions` | Yes | Streaming and buffered compat adapter |
 
 ---
 
@@ -210,7 +210,7 @@ rejects unknown models instead of silently using `models.fallback` (the legacy
 field remains accepted), removes permissive browser CORS, and omits upstream
 headers and response bodies from diagnostics. Keep the API and temporary OAuth
 callback on loopback. Bifrost supplies authenticated access and concurrency limits.
-The chat adapter translates function tools; use `/v1/responses` for streaming.
+The chat adapter translates function tools and streams text/tool-call deltas.
 
 For a remote server, OAuth needs no public route, DNS name, TLS certificate, or
 inbound firewall rule. Use a temporary SSH localhost tunnel or the paste fallback.

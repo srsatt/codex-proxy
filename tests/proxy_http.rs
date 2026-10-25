@@ -142,7 +142,13 @@ async fn mock_responses_handler(
         .status(state.responses_status)
         .header(header::CONTENT_TYPE, state.responses_content_type.as_str())
         .header("x-request-id", MOCK_UPSTREAM_REQUEST_ID)
-        .body(Body::from(state.responses_body.clone()))
+        .body(if state.responses_body.contains("resp_live") {
+            let text=state.responses_body.clone();
+            Body::from_stream(async_stream::stream! {
+                for byte in text.into_bytes() { yield Ok::<Bytes,std::convert::Infallible>(Bytes::from(vec![byte])); }
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            })
+        } else { Body::from(state.responses_body.clone()) })
         .expect("responses response")
 }
 
@@ -616,31 +622,51 @@ async fn chat_completions_route_converts_upstream_sse_to_chat_completion_json() 
 }
 
 #[tokio::test]
-async fn chat_completions_route_rejects_streaming_requests() {
-    let temp = tempdir().expect("tempdir");
+async fn chat_completions_route_streams_before_upstream_finishes() {
+    let upstream = MockUpstream::spawn(StatusCode::OK,"text/event-stream",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_live\",\"model\":\"gpt-5.3-codex\",\"created_at\":1}}\n\ndata: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"Привет\"}\n\n", None).await;
+    let temp = tempdir().unwrap();
     let paths = test_paths(&temp);
-    paths.ensure_runtime_layout().expect("runtime layout");
-    let app = make_proxy_app(Config::default(), paths, "sk-codex-proxy-test", None);
-
-    let response = app
-        .oneshot(auth_json_request(
-            "/v1/chat/completions",
-            "sk-codex-proxy-test",
-            &json!({
-                "model": "gpt-5.4",
-                "stream": true,
-                "messages": [
-                    { "role": "user", "content": "hello" }
-                ]
-            }),
-        ))
+    paths.ensure_runtime_layout().unwrap();
+    let app = make_proxy_app(
+        make_config(&upstream),
+        paths,
+        "sk-codex-proxy-test",
+        Some(make_token(
+            "account-123",
+            "refresh-123",
+            unix_timestamp_secs() + 3600,
+        )),
+    );
+    let response=app.oneshot(auth_json_request("/v1/chat/completions","sk-codex-proxy-test",&json!({"model":"gpt-5.3-codex","stream":true,"messages":[{"role":"user","content":"hello"}]}))).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()[header::CONTENT_TYPE],
+        "text/event-stream; charset=utf-8"
+    );
+    let mut body = response.into_body().into_data_stream();
+    let first = tokio::time::timeout(std::time::Duration::from_secs(2), body.next())
         .await
-        .expect("response");
-
-    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
-    assert!(response.headers().contains_key("x-codex-proxy-request-id"));
-    let payload = read_json(response).await;
-    assert_eq!(payload["error"]["type"], "proxy_error");
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(
+        std::str::from_utf8(&first)
+            .unwrap()
+            .contains("chat.completion.chunk")
+    );
+    let second = tokio::time::timeout(std::time::Duration::from_secs(2), body.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(std::str::from_utf8(&second).unwrap().contains("Привет"));
+    // The mock is still waiting; dropping the client must not buffer that wait.
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), body.next())
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]
@@ -904,4 +930,47 @@ async fn profiled_reasoning_is_not_stripped_on_upstream_rejection() {
     let recorded = upstream.responses_requests.lock().await;
     assert_eq!(recorded.len(), 1);
     assert_eq!(recorded[0].body["reasoning"]["effort"], "xhigh");
+}
+
+#[tokio::test]
+async fn chat_stream_terminal_and_failure_frames() {
+    for (source, success) in [
+        (
+            "data: {\"type\":\"response.done\",\"response\":{\"id\":\"resp_end\",\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"Done\"}]}],\"usage\":{\"input_tokens\":1,\"output_tokens\":2,\"total_tokens\":3}}}\r\n\r\n",
+            true,
+        ),
+        (
+            "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"private-upstream-value\"}}}\n\n",
+            false,
+        ),
+        ("data: invalid json\n\n", false),
+        (
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_unfinished\"}}\n\n",
+            false,
+        ),
+    ] {
+        let upstream = MockUpstream::spawn(StatusCode::OK, "text/event-stream", source, None).await;
+        let temp = tempdir().unwrap();
+        let paths = test_paths(&temp);
+        paths.ensure_runtime_layout().unwrap();
+        let app = make_proxy_app(
+            make_config(&upstream),
+            paths,
+            "sk-codex-proxy-test",
+            Some(make_token(
+                "account-123",
+                "refresh-123",
+                unix_timestamp_secs() + 3600,
+            )),
+        );
+        let response=app.oneshot(auth_json_request("/v1/chat/completions","sk-codex-proxy-test",&json!({"model":"gpt-5.3-codex","stream":true,"stream_options":{"include_usage":true},"messages":[{"role":"user","content":"hello"}]}))).await.unwrap();
+        let body = read_text(response).await;
+        assert_eq!(body.contains("data: [DONE]"), success, "{body}");
+        assert_eq!(body.contains("upstream_stream_error"), !success, "{body}");
+        assert!(!body.contains("private-upstream-value"));
+        if success {
+            assert!(body.contains("\"total_tokens\":3"));
+            assert!(body.contains("Done"));
+        }
+    }
 }

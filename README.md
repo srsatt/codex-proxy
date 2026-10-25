@@ -477,7 +477,7 @@ x-api-key: sk-codex-proxy-<hex>
 | GET | `/v1/responses` | WebSocket compatibility transport |
 | POST | `/v1/responses` | Primary forwarding route (streaming supported) |
 | POST | `/v1/responses/compact` | Compact response forwarding route |
-| POST | `/v1/chat/completions` | Non-streaming compat adapter |
+| POST | `/v1/chat/completions` | Streaming and buffered compat adapter |
 
 ### Health check response
 
@@ -490,7 +490,7 @@ x-api-key: sk-codex-proxy-<hex>
   "fake_api_key_configured": true,
   "chat_completions_compatibility": {
     "implemented": true,
-    "streaming_supported": false
+    "streaming_supported": true
   }
 }
 ```
@@ -517,8 +517,8 @@ Inside Docker (`WORKDIR /app`):
 
 ## Known limitations
 
-- `POST /v1/chat/completions` does not support streaming. Use `POST /v1/responses`
-  for streaming.
+- `POST /v1/chat/completions` translates text and function-call deltas into
+  Chat Completion SSE chunks; `stream_options.include_usage` adds final usage.
 - `GET /v1/responses` is a WebSocket transport intended for Codex-style clients;
   standard OpenAI SDKs should keep using the HTTP `POST /v1/responses` route.
 - The proxy advertises only the models listed in `config.toml`; it does not
@@ -564,7 +564,7 @@ rejects unknown models instead of silently using `models.fallback` (the legacy
 field remains accepted), removes permissive browser CORS, and omits upstream
 headers and response bodies from diagnostics. Keep the API and temporary OAuth
 callback on loopback. Bifrost supplies authenticated access and concurrency limits.
-The non-streaming chat adapter is unchanged; use `/v1/responses` for streaming.
+The chat adapter supports buffered replies and incremental text/tool-call SSE replies.
 
 For a remote server, OAuth needs no public route, DNS name, TLS certificate, or
 inbound firewall rule. Use a temporary SSH localhost tunnel or the paste fallback.
